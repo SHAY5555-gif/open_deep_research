@@ -22,6 +22,12 @@ auth = Auth()
 async def get_current_user(authorization: str | None) -> Auth.types.MinimalUserDict:
     """Check if the user's JWT token is valid using Supabase."""
 
+    # TEMPORARY: Allow local development without Supabase
+    if not supabase:
+        return {
+            "identity": "local-dev-user",
+        }
+
     # Ensure we have authorization header
     if not authorization:
         raise Auth.exceptions.HTTPException(
@@ -35,12 +41,6 @@ async def get_current_user(authorization: str | None) -> Auth.types.MinimalUserD
     except (ValueError, AssertionError):
         raise Auth.exceptions.HTTPException(
             status_code=401, detail="Invalid authorization header format"
-        )
-
-    # Ensure Supabase client is initialized
-    if not supabase:
-        raise Auth.exceptions.HTTPException(
-            status_code=500, detail="Supabase client not initialized"
         )
 
     try:

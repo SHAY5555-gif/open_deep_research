@@ -9,6 +9,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiohttp
 from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -83,7 +84,7 @@ async def tavily_search(
     
     # Initialize summarization model with retry logic
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
+    summarization_model = init_model_with_openrouter(
         model=configurable.summarization_model,
         max_tokens=configurable.summarization_model_max_tokens,
         api_key=model_api_key,
@@ -889,6 +890,75 @@ def get_config_value(value):
     else:
         return value.value
 
+def init_model_with_openrouter(
+    model: str,
+    max_tokens: int = None,
+    api_key: str = None,
+    tags: List[str] = None,
+    provider: str = "Cerebras"
+) -> BaseChatModel:
+    """Initialize a chat model with OpenRouter support and optional provider routing.
+
+    Args:
+        model: Model string in format "openrouter:provider/model-name" or "provider:model-name"
+        max_tokens: Maximum tokens for model output
+        api_key: API key for the model provider
+        tags: Optional tags for LangSmith tracking
+        provider: Hardware provider for OpenRouter (default: "Cerebras")
+
+    Returns:
+        Initialized chat model instance
+    """
+    model_lower = model.lower()
+
+    # Check if this is an OpenRouter model
+    if model_lower.startswith("openrouter:"):
+        # Extract the actual model name (remove "openrouter:" prefix)
+        actual_model_name = model[len("openrouter:"):]
+
+        # Configure model parameters
+        model_params = {
+            "model": actual_model_name,
+            "openai_api_key": api_key,
+            "openai_api_base": "https://openrouter.ai/api/v1",
+        }
+
+        # Add max_tokens if specified
+        if max_tokens:
+            model_params["max_tokens"] = max_tokens
+
+        # Add tags if specified
+        if tags:
+            model_params["tags"] = tags
+
+        # Add Cerebras provider routing via extra_body (OpenRouter-specific parameter)
+        # Using "only" to enforce hard requirement - no fallbacks allowed
+        if provider:
+            model_params["extra_body"] = {
+                "provider": {
+                    "only": [provider],
+                    "allow_fallbacks": False
+                }
+            }
+
+        # Initialize ChatOpenAI with OpenRouter configuration
+        return ChatOpenAI(**model_params)
+
+    else:
+        # Use standard LangChain init_chat_model for non-OpenRouter models
+        init_params = {
+            "model": model,
+            "api_key": api_key,
+        }
+
+        if max_tokens:
+            init_params["max_tokens"] = max_tokens
+
+        if tags:
+            init_params["tags"] = tags
+
+        return init_chat_model(**init_params)
+
 def get_api_key_for_model(model_name: str, config: RunnableConfig):
     """Get API key for a specific model from environment or config."""
     should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
@@ -903,14 +973,18 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
             return api_keys.get("GOOGLE_API_KEY")
+        elif model_name.startswith("openrouter:"):
+            return api_keys.get("OPENROUTER_API_KEY")
         return None
     else:
-        if model_name.startswith("openai:"): 
+        if model_name.startswith("openai:"):
             return os.getenv("OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
             return os.getenv("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
             return os.getenv("GOOGLE_API_KEY")
+        elif model_name.startswith("openrouter:"):
+            return os.getenv("OPENROUTER_API_KEY")
         return None
 
 def get_tavily_api_key(config: RunnableConfig):
