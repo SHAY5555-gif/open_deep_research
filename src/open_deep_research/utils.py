@@ -29,10 +29,306 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.config import get_store
 from mcp import McpError
 from tavily import AsyncTavilyClient
+from brightdata import bdclient
+from firecrawl import AsyncFirecrawl
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+
+##########################
+# BrightData Search Tool Utils
+##########################
+BRIGHTDATA_SEARCH_DESCRIPTION = (
+    "A powerful search engine optimized for comprehensive, accurate web data collection. "
+    "Useful for when you need to answer questions about current events with reliable data."
+)
+
+@tool(description=BRIGHTDATA_SEARCH_DESCRIPTION)
+async def brightdata_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None
+) -> str:
+    """Fetch and summarize search results from BrightData search API.
+
+    Args:
+        queries: List of search queries to execute
+        max_results: Maximum number of results to return per query
+        config: Runtime configuration for API keys and model settings
+
+    Returns:
+        Formatted string containing summarized search results
+    """
+    print(f"[BRIGHTDATA] brightdata_search called with {len(queries)} queries: {queries}")
+    # Step 1: Execute search queries
+    search_results = await brightdata_search_async(
+        queries,
+        max_results=max_results,
+        config=config
+    )
+
+    # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
+    unique_results = {}
+    for response in search_results:
+        for result in response.get('results', []):
+            url = result.get('url')
+            if url and url not in unique_results:
+                unique_results[url] = {**result, "query": response.get('query', '')}
+
+    # Step 3: Set up the summarization model with configuration
+    configurable = Configuration.from_runnable_config(config)
+
+    # Character limit to stay within model token limits (configurable)
+    max_char_to_include = configurable.max_content_length
+
+    # Initialize summarization model with retry logic
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    summarization_model = init_model_with_openrouter(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"]
+    ).with_structured_output(Summary).with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
+    )
+
+    # Step 4: Create summarization tasks (skip empty content)
+    async def noop():
+        """No-op function for results without raw content."""
+        return None
+
+    summarization_tasks = [
+        noop() if not result.get("content")
+        else summarize_webpage(
+            summarization_model,
+            result['content'][:max_char_to_include]
+        )
+        for result in unique_results.values()
+    ]
+
+    # Step 5: Run all summarization tasks concurrently
+    summaries = await asyncio.gather(*summarization_tasks)
+
+    # Step 6: Format the output with summaries and metadata
+    formatted_output = ""
+    for result, summary in zip(unique_results.values(), summaries):
+        if summary is None:
+            continue
+
+        formatted_output += f"**Source:** {result['url']}\n"
+        formatted_output += f"**Query:** {result['query']}\n"
+        formatted_output += f"**Title:** {result.get('title', 'N/A')}\n"
+        formatted_output += f"**Summary:**\n{summary}\n"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+
+    return formatted_output
+
+async def brightdata_search_async(
+    search_queries,
+    max_results: int = 5,
+    config: RunnableConfig = None
+):
+    """Execute multiple BrightData search queries asynchronously.
+
+    Args:
+        search_queries: List of search query strings to execute
+        max_results: Maximum number of results per query
+        config: Runtime configuration for API key access
+
+    Returns:
+        List of search result dictionaries from BrightData API
+    """
+    # Initialize the BrightData client with API token and SERP zone from config
+    api_token = get_brightdata_api_token(config)
+    serp_zone = os.getenv("SERP_ZONE")
+    print(f"[BRIGHTDATA] Initializing BrightData client with API token: {api_token[:20]}... and SERP zone: {serp_zone}")
+    client = bdclient(api_token=api_token, serp_zone=serp_zone)
+
+    # Execute searches for each query
+    search_results = []
+    for query in search_queries:
+        try:
+            # Use BrightData SDK search function
+            print(f"[BRIGHTDATA] Searching for: {query}")
+            results = client.search(query=query)
+
+            # Parse results using BrightData's parser
+            parsed_results = client.parse_content(results)
+            print(f"[BRIGHTDATA] Successfully received {len(parsed_results.get('organic_results', []))} results for query: {query}")
+
+            # Format to match expected structure
+            formatted_result = {
+                'query': query,
+                'results': []
+            }
+
+            # Extract search results from parsed content
+            if isinstance(parsed_results, dict):
+                organic_results = parsed_results.get('organic_results', [])
+                for i, item in enumerate(organic_results[:max_results]):
+                    formatted_result['results'].append({
+                        'url': item.get('url', ''),
+                        'title': item.get('title', ''),
+                        'content': item.get('description', '') + ' ' + item.get('snippet', ''),
+                        'score': 1.0 - (i * 0.1)  # Simple scoring based on position
+                    })
+
+            search_results.append(formatted_result)
+        except Exception as e:
+            print(f"Error searching with BrightData for query '{query}': {e}")
+            search_results.append({'query': query, 'results': []})
+
+    return search_results
+
+##########################
+# FireCrawl Search Tool Utils
+##########################
+FIRECRAWL_SEARCH_DESCRIPTION = (
+    "A powerful web search and scraping engine optimized for AI-ready content extraction. "
+    "Automatically scrapes and converts web pages to clean markdown format. "
+    "Useful for when you need to answer questions about current events with full page content."
+)
+
+@tool(description=FIRECRAWL_SEARCH_DESCRIPTION)
+async def firecrawl_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None
+) -> str:
+    """Fetch and summarize search results from FireCrawl search API.
+
+    Args:
+        queries: List of search queries to execute
+        max_results: Maximum number of results to return per query
+        config: Runtime configuration for API keys and model settings
+
+    Returns:
+        Formatted string containing summarized search results
+    """
+    print(f"[FIRECRAWL] firecrawl_search called with {len(queries)} queries: {queries}")
+    # Step 1: Execute search queries
+    search_results = await firecrawl_search_async(
+        queries,
+        max_results=max_results,
+        config=config
+    )
+
+    # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
+    unique_results = {}
+    for response in search_results:
+        for result in response.get('results', []):
+            url = result.get('url')
+            if url and url not in unique_results:
+                unique_results[url] = {**result, "query": response.get('query', '')}
+
+    # Step 3: Set up the summarization model with configuration
+    configurable = Configuration.from_runnable_config(config)
+
+    # Character limit to stay within model token limits (configurable)
+    max_char_to_include = configurable.max_content_length
+
+    # Initialize summarization model with retry logic
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    summarization_model = init_model_with_openrouter(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"]
+    ).with_structured_output(Summary).with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
+    )
+
+    # Step 4: Create summarization tasks (skip empty content)
+    async def noop():
+        """No-op function for results without raw content."""
+        return None
+
+    summarization_tasks = [
+        noop() if not result.get("content")
+        else summarize_webpage(
+            summarization_model,
+            result['content'][:max_char_to_include]
+        )
+        for result in unique_results.values()
+    ]
+
+    # Step 5: Run all summarization tasks concurrently
+    summaries = await asyncio.gather(*summarization_tasks)
+
+    # Step 6: Format the output with summaries and metadata
+    formatted_output = ""
+    for result, summary in zip(unique_results.values(), summaries):
+        if summary is None:
+            continue
+
+        formatted_output += f"**Source:** {result['url']}\n"
+        formatted_output += f"**Query:** {result['query']}\n"
+        formatted_output += f"**Title:** {result.get('title', 'N/A')}\n"
+        formatted_output += f"**Summary:**\n{summary}\n"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+
+    return formatted_output
+
+async def firecrawl_search_async(
+    search_queries,
+    max_results: int = 5,
+    config: RunnableConfig = None
+):
+    """Execute multiple FireCrawl search queries asynchronously.
+
+    Args:
+        search_queries: List of search query strings to execute
+        max_results: Maximum number of results per query
+        config: Runtime configuration for API key access
+
+    Returns:
+        List of search result dictionaries from FireCrawl API
+    """
+    # Initialize the FireCrawl client with API key from config
+    api_key = get_firecrawl_api_key(config)
+    print(f"[FIRECRAWL] Initializing FireCrawl client with API key: {api_key[:20] if api_key else 'None'}...")
+    client = AsyncFirecrawl(api_key=api_key)
+
+    # Execute searches for each query
+    search_results = []
+    for query in search_queries:
+        try:
+            # Use FireCrawl SDK search function with scraping enabled
+            print(f"[FIRECRAWL] Searching for: {query}")
+            results = await client.search(
+                query=query,
+                limit=max_results,
+                scrape_options={
+                    "formats": ["markdown"]
+                }
+            )
+
+            print(f"[FIRECRAWL] Successfully received results for query: {query}")
+
+            # Format to match expected structure
+            formatted_result = {
+                'query': query,
+                'results': []
+            }
+
+            # Extract search results - FireCrawl returns data with full content
+            if isinstance(results, dict) and 'data' in results:
+                data = results.get('data', [])
+                for i, item in enumerate(data[:max_results]):
+                    formatted_result['results'].append({
+                        'url': item.get('url', ''),
+                        'title': item.get('title', ''),
+                        'content': item.get('markdown', '') or item.get('description', ''),
+                        'score': 1.0 - (i * 0.1)  # Simple scoring based on position
+                    })
+
+            search_results.append(formatted_result)
+        except Exception as e:
+            print(f"Error searching with FireCrawl for query '{query}': {e}")
+            search_results.append({'query': query, 'results': []})
+
+    return search_results
 
 ##########################
 # Tavily Search Tool Utils
@@ -144,19 +440,26 @@ async def tavily_search_async(
     config: RunnableConfig = None
 ):
     """Execute multiple Tavily search queries asynchronously.
-    
+
     Args:
         search_queries: List of search query strings to execute
         max_results: Maximum number of results per query
         topic: Topic category for filtering results
         include_raw_content: Whether to include full webpage content
         config: Runtime configuration for API key access
-        
+
     Returns:
         List of search result dictionaries from Tavily API
     """
+    # Get API key and validate it's not a dummy key
+    api_key = get_tavily_api_key(config)
+    if api_key == "dummy-key-for-scanning":
+        raise ToolException(
+            "Tavily API key not configured. Please provide a valid TAVILY_API_KEY to use this search tool."
+        )
+
     # Initialize the Tavily client with API key from config
-    tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
+    tavily_client = AsyncTavilyClient(api_key=api_key)
     
     # Create search tasks for parallel execution
     search_tasks = [
@@ -452,59 +755,83 @@ async def load_mcp_tools(
     existing_tool_names: set[str],
 ) -> list[BaseTool]:
     """Load and configure MCP (Model Context Protocol) tools with authentication.
-    
+
     Args:
         config: Runtime configuration containing MCP server details
         existing_tool_names: Set of tool names already in use to avoid conflicts
-        
+
     Returns:
         List of configured MCP tools ready for use
     """
+    from datetime import timedelta
     configurable = Configuration.from_runnable_config(config)
-    
-    # Step 1: Handle authentication if required
-    if configurable.mcp_config and configurable.mcp_config.auth_required:
-        mcp_tokens = await fetch_tokens(config)
-    else:
-        mcp_tokens = None
-    
-    # Step 2: Validate configuration requirements
-    config_valid = (
-        configurable.mcp_config and 
-        configurable.mcp_config.url and 
-        configurable.mcp_config.tools and 
-        (mcp_tokens or not configurable.mcp_config.auth_required)
-    )
-    
-    if not config_valid:
+
+    # Build MCP server configuration
+    mcp_server_config = {}
+
+    # Step 1: Add Bright Data MCP if search_api is BRIGHTDATA
+    search_api = SearchAPI(get_config_value(configurable.search_api))
+    if search_api == SearchAPI.BRIGHTDATA:
+        brightdata_token = get_brightdata_api_token(config)
+        if brightdata_token:
+            print(f"[MCP] Adding Bright Data MCP with token: {brightdata_token[:20]}...")
+            mcp_server_config["bright_data"] = {
+                "url": f"https://mcp.brightdata.com/mcp?token={brightdata_token}",
+                "transport": "streamable_http",
+                "timeout": timedelta(seconds=45),
+                "sse_read_timeout": timedelta(seconds=45),
+            }
+
+    # Step 1b: Add FireCrawl MCP if search_api is FIRECRAWL
+    elif search_api == SearchAPI.FIRECRAWL:
+        firecrawl_key = get_firecrawl_api_key(config)
+        if firecrawl_key:
+            print(f"[MCP] Adding FireCrawl MCP with API key: {firecrawl_key[:20]}...")
+            mcp_server_config["firecrawl"] = {
+                "url": f"https://mcp.firecrawl.dev/{firecrawl_key}/v2/mcp",
+                "transport": "streamable_http",
+                "timeout": timedelta(seconds=60),
+                "sse_read_timeout": timedelta(seconds=60),
+            }
+
+    # Step 2: Add user-configured MCP server if provided
+    if configurable.mcp_config and configurable.mcp_config.url and configurable.mcp_config.tools:
+        # Handle authentication if required
+        if configurable.mcp_config.auth_required:
+            mcp_tokens = await fetch_tokens(config)
+        else:
+            mcp_tokens = None
+
+        # Validate authentication
+        if mcp_tokens or not configurable.mcp_config.auth_required:
+            # Set up MCP server connection
+            server_url = configurable.mcp_config.url.rstrip("/") + "/mcp"
+
+            # Configure authentication headers if tokens are available
+            auth_headers = None
+            if mcp_tokens:
+                auth_headers = {"Authorization": f"Bearer {mcp_tokens['access_token']}"}
+
+            mcp_server_config["user_mcp"] = {
+                "url": server_url,
+                "headers": auth_headers,
+                "transport": "streamable_http"
+            }
+
+    # If no MCP servers configured, return empty list
+    if not mcp_server_config:
         return []
-    
-    # Step 3: Set up MCP server connection
-    server_url = configurable.mcp_config.url.rstrip("/") + "/mcp"
-    
-    # Configure authentication headers if tokens are available
-    auth_headers = None
-    if mcp_tokens:
-        auth_headers = {"Authorization": f"Bearer {mcp_tokens['access_token']}"}
-    
-    mcp_server_config = {
-        "server_1": {
-            "url": server_url,
-            "headers": auth_headers,
-            "transport": "streamable_http"
-        }
-    }
-    # TODO: When Multi-MCP Server support is merged in OAP, update this code
-    
-    # Step 4: Load tools from MCP server
+
+    # Step 3: Load tools from all MCP servers
     try:
         client = MultiServerMCPClient(mcp_server_config)
         available_mcp_tools = await client.get_tools()
-    except Exception:
+    except Exception as e:
         # If MCP server connection fails, return empty list
+        print(f"[MCP] Failed to connect to MCP servers: {e}")
         return []
-    
-    # Step 5: Filter and configure tools
+
+    # Step 4: Filter and configure tools
     configured_tools = []
     for mcp_tool in available_mcp_tools:
         # Skip tools with conflicting names
@@ -513,15 +840,17 @@ async def load_mcp_tools(
                 f"MCP tool '{mcp_tool.name}' conflicts with existing tool name - skipping"
             )
             continue
-        
-        # Only include tools specified in configuration
-        if mcp_tool.name not in set(configurable.mcp_config.tools):
-            continue
-        
+
+        # If user has specific tools configured, only include those
+        if configurable.mcp_config and configurable.mcp_config.tools:
+            if mcp_tool.name not in set(configurable.mcp_config.tools):
+                continue
+
         # Wrap tool with authentication handling and add to list
         enhanced_tool = wrap_mcp_authenticate_tool(mcp_tool)
         configured_tools.append(enhanced_tool)
-    
+        print(f"[MCP] Loaded tool: {mcp_tool.name}")
+
     return configured_tools
 
 
@@ -531,35 +860,49 @@ async def load_mcp_tools(
 
 async def get_search_tool(search_api: SearchAPI):
     """Configure and return search tools based on the specified API provider.
-    
+
     Args:
-        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, or None)
-        
+        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, FireCrawl, or None)
+
     Returns:
         List of configured search tool objects for the specified provider
     """
     if search_api == SearchAPI.ANTHROPIC:
         # Anthropic's native web search with usage limits
         return [{
-            "type": "web_search_20250305", 
-            "name": "web_search", 
+            "type": "web_search_20250305",
+            "name": "web_search",
             "max_uses": 5
         }]
-        
+
     elif search_api == SearchAPI.OPENAI:
         # OpenAI's web search preview functionality
         return [{"type": "web_search_preview"}]
-        
+
+    elif search_api == SearchAPI.BRIGHTDATA:
+        # BrightData tools are loaded via MCP in load_mcp_tools()
+        # No need to return search tools here as they come from MCP
+        return []
+
+    elif search_api == SearchAPI.FIRECRAWL:
+        # Configure FireCrawl search tool with metadata
+        search_tool = firecrawl_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}),
+            "tool_description": "Search tool using FireCrawl API for comprehensive web research"
+        }
+        return [search_tool]
+
     elif search_api == SearchAPI.TAVILY:
         # Configure Tavily search tool with metadata
         search_tool = tavily_search
         search_tool.metadata = {
-            **(search_tool.metadata or {}), 
-            "type": "search", 
+            **(search_tool.metadata or {}),
+            "type": "search",
             "name": "web_search"
         }
         return [search_tool]
-        
+
     elif search_api == SearchAPI.NONE:
         # No search functionality configured
         return []
@@ -993,7 +1336,29 @@ def get_tavily_api_key(config: RunnableConfig):
     if should_get_from_config.lower() == "true":
         api_keys = config.get("configurable", {}).get("apiKeys", {})
         if not api_keys:
-            return None
-        return api_keys.get("TAVILY_API_KEY")
+            return os.getenv("TAVILY_API_KEY", "dummy-key-for-scanning")
+        return api_keys.get("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY", "dummy-key-for-scanning"))
     else:
-        return os.getenv("TAVILY_API_KEY")
+        return os.getenv("TAVILY_API_KEY", "dummy-key-for-scanning")
+
+def get_brightdata_api_token(config: RunnableConfig):
+    """Get BrightData API token from environment or config."""
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        api_keys = config.get("configurable", {}).get("apiKeys", {})
+        if not api_keys:
+            return os.getenv("BRIGHTDATA_API_TOKEN", "dummy-key-for-scanning")
+        return api_keys.get("BRIGHTDATA_API_TOKEN", os.getenv("BRIGHTDATA_API_TOKEN", "dummy-key-for-scanning"))
+    else:
+        return os.getenv("BRIGHTDATA_API_TOKEN", "dummy-key-for-scanning")
+
+def get_firecrawl_api_key(config: RunnableConfig):
+    """Get FireCrawl API key from environment or config."""
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        api_keys = config.get("configurable", {}).get("apiKeys", {})
+        if not api_keys:
+            return os.getenv("FIRECRAWL_API_KEY", "dummy-key-for-scanning")
+        return api_keys.get("FIRECRAWL_API_KEY", os.getenv("FIRECRAWL_API_KEY", "dummy-key-for-scanning"))
+    else:
+        return os.getenv("FIRECRAWL_API_KEY", "dummy-key-for-scanning")
