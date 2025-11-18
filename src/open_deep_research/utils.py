@@ -139,8 +139,14 @@ async def brightdata_search_async(
     Returns:
         List of search result dictionaries from BrightData API
     """
-    # Initialize the BrightData client with API token and SERP zone from config
+    # Get API token and validate it's not a dummy key
     api_token = get_brightdata_api_token(config)
+    if api_token == "dummy-key-for-scanning":
+        raise ToolException(
+            "BrightData API token not configured. Please provide a valid BRIGHTDATA_API_TOKEN to use this search tool."
+        )
+
+    # Initialize the BrightData client with API token and SERP zone from config
     serp_zone = os.getenv("SERP_ZONE")
     print(f"[BRIGHTDATA] Initializing BrightData client with API token: {api_token[:20]}... and SERP zone: {serp_zone}")
     client = bdclient(api_token=api_token, serp_zone=serp_zone)
@@ -285,8 +291,14 @@ async def firecrawl_search_async(
     Returns:
         List of search result dictionaries from FireCrawl API
     """
-    # Initialize the FireCrawl client with API key from config
+    # Get API key and validate it's not a dummy key
     api_key = get_firecrawl_api_key(config)
+    if api_key == "dummy-key-for-scanning":
+        raise ToolException(
+            "FireCrawl API key not configured. Please provide a valid FIRECRAWL_API_KEY to use this search tool."
+        )
+
+    # Initialize the FireCrawl client with API key from config
     print(f"[FIRECRAWL] Initializing FireCrawl client with API key: {api_key[:20] if api_key else 'None'}...")
     client = AsyncFirecrawl(api_key=api_key)
 
