@@ -9,45 +9,38 @@ build:
 startCommand:
   type: "http"
   port: 8080
-
-configSchema:
-  type: "object"
-  required: ["tavilyApiKey", "openrouterApiKey"]
-  properties:
-    tavilyApiKey:
-      type: "string"
-      title: "Tavily API Key"
-      description: "API token injected into TAVILY_API_KEY when the container boots."
-      secret: true
-    openrouterApiKey:
-      type: "string"
-      title: "OpenRouter API Key"
-      description: "API token injected into OPENROUTER_API_KEY for model routing."
-      secret: true
-
-commandFunction: |-
-  (config) => ({
-    command: "uv",
-    args: [
-      "run",
-      "langgraph",
-      "start",
-      "--host",
-      "0.0.0.0",
-      "--port",
-      "8080"
-    ],
-    env: {
-      TAVILY_API_KEY: config.tavilyApiKey,
-      OPENROUTER_API_KEY: config.openrouterApiKey,
-      SEARCH_API: "tavily"
-    }
-  })
-
-exampleConfig:
-  tavilyApiKey: "tvly-example123"
-  openrouterApiKey: "sk-or-example123"
-
-testConfig:
-  tavilyApiKey: "${TAVILY_API_KEY}"
-  openrouterApiKey: "${OPENROUTER_API_KEY}"
+  configSchema:
+    type: "object"
+    required: ["tavilyApiKey", "openrouterApiKey"]
+    properties:
+      tavilyApiKey:
+        type: "string"
+        title: "Tavily API Key"
+        description: "API token injected into TAVILY_API_KEY when the container boots."
+        secret: true
+      openrouterApiKey:
+        type: "string"
+        title: "OpenRouter API Key"
+        description: "API token injected into OPENROUTER_API_KEY for model routing."
+        secret: true
+  commandFunction: |-
+    (config) => ({
+      command: "uv",
+      args: [
+        "run",
+        "langgraph",
+        "start",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8080"
+      ],
+      env: {
+        TAVILY_API_KEY: config.tavilyApiKey,
+        OPENROUTER_API_KEY: config.openrouterApiKey,
+        SEARCH_API: "tavily"
+      }
+    })
+  exampleConfig:
+    tavilyApiKey: "tvly-example123"
+    openrouterApiKey: "sk-or-example123"
