@@ -1,60 +1,50 @@
 runtime: "container"
 name: "open-deep-research-mcp"
 description: "LangGraph Deep Research MCP server backed by Tavily + OpenRouter."
+
 build:
   dockerfile: "Dockerfile"
   dockerBuildPath: "."
+
 startCommand:
   type: "http"
-  endpoint: "/mcp"
   port: 8080
-  configSchema:
-    type: "object"
-    required: ["tavilyApiKey", "openrouterApiKey"]
-    properties:
-      tavilyApiKey:
-        type: "string"
-        title: "Tavily API Key"
-        description: "API token injected into TAVILY_API_KEY when the container boots."
-        secret: true
-      openrouterApiKey:
-        type: "string"
-        title: "OpenRouter API Key"
-        description: "API token injected into OPENROUTER_API_KEY for model routing."
-        secret: true
-  commandFunction: |-
-    (config) => ({
-      command: "uv",
-      args: [
-        "run",
-        "langgraph",
-        "dev",
-        "--allow-blocking",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8080"
-      ],
-      env: {
-        TAVILY_API_KEY: config.tavilyApiKey,
-        OPENROUTER_API_KEY: config.openrouterApiKey,
-        SEARCH_API: "tavily"
-      }
-    })
-mcpServers:
-  deepResearch:
-    url: "http://127.0.0.1:8080/mcp"
-assistants:
-  - name: "Deep Research"
-    description: "Single prompt MCP tool that produces a full deep research report."
-    tools:
-      - server: "deepResearch"
-        name: "Deep Research"
-        toolTimeoutMs: 300000
-        argumentSchema:
-          type: "object"
-          required: ["topic"]
-          properties:
-            topic:
-              type: "string"
-              description: "Describe the subject you want fully researched."
+
+configSchema:
+  type: "object"
+  required: ["tavilyApiKey", "openrouterApiKey"]
+  properties:
+    tavilyApiKey:
+      type: "string"
+      title: "Tavily API Key"
+      description: "API token injected into TAVILY_API_KEY when the container boots."
+      secret: true
+    openrouterApiKey:
+      type: "string"
+      title: "OpenRouter API Key"
+      description: "API token injected into OPENROUTER_API_KEY for model routing."
+      secret: true
+
+commandFunction: |-
+  (config) => ({
+    command: "uv",
+    args: [
+      "run",
+      "langgraph",
+      "dev",
+      "--allow-blocking",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "8080"
+    ],
+    env: {
+      TAVILY_API_KEY: config.tavilyApiKey,
+      OPENROUTER_API_KEY: config.openrouterApiKey,
+      SEARCH_API: "tavily"
+    }
+  })
+
+exampleConfig:
+  tavilyApiKey: "tvly-example123"
+  openrouterApiKey: "sk-or-example123"

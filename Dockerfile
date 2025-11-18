@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir uv
 WORKDIR /app
 COPY . /app
 
-RUN uv sync --frozen --locked --python 3.11
+RUN uv sync --frozen --python 3.11
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
