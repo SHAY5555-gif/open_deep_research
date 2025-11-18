@@ -11,7 +11,6 @@ startCommand:
   port: 8080
   configSchema:
     type: "object"
-    required: ["tavilyApiKey", "openrouterApiKey"]
     properties:
       tavilyApiKey:
         type: "string"
@@ -36,8 +35,8 @@ startCommand:
         "8080"
       ],
       env: {
-        TAVILY_API_KEY: config.tavilyApiKey,
-        OPENROUTER_API_KEY: config.openrouterApiKey,
+        TAVILY_API_KEY: config.tavilyApiKey || process.env.TAVILY_API_KEY,
+        OPENROUTER_API_KEY: config.openrouterApiKey || process.env.OPENROUTER_API_KEY,
         SEARCH_API: "tavily"
       }
     })
