@@ -1,7 +1,23 @@
 {
     "dockerfile_lines": [],
     "graphs": {
-      "Deep Researcher": "./src/open_deep_research/deep_researcher.py:deep_researcher"
+      "Deep Researcher": "./src/open_deep_research/deep_researcher.py:deep_researcher",
+      "Deep Research": {
+        "path": "./src/open_deep_research/mcp_entry.py:deep_research_topic_graph",
+        "description": "Single-argument Deep Research tool that accepts a topic string and returns a report plus message trace.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Describe the subject you want fully researched."
+            }
+          },
+          "required": [
+            "topic"
+          ]
+        }
+      }
     },
     "python_version": "3.11",
     "env": "./.env",
