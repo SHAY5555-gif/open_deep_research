@@ -1321,26 +1321,26 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
     if should_get_from_config.lower() == "true":
         api_keys = config.get("configurable", {}).get("apiKeys", {})
         if not api_keys:
-            return None
+            return "dummy-key-for-scanning"
         if model_name.startswith("openai:"):
-            return api_keys.get("OPENAI_API_KEY")
+            return api_keys.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "dummy-key-for-scanning"))
         elif model_name.startswith("anthropic:"):
-            return api_keys.get("ANTHROPIC_API_KEY")
+            return api_keys.get("ANTHROPIC_API_KEY", os.getenv("ANTHROPIC_API_KEY", "dummy-key-for-scanning"))
         elif model_name.startswith("google"):
-            return api_keys.get("GOOGLE_API_KEY")
+            return api_keys.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", "dummy-key-for-scanning"))
         elif model_name.startswith("openrouter:"):
-            return api_keys.get("OPENROUTER_API_KEY")
-        return None
+            return api_keys.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "dummy-key-for-scanning"))
+        return "dummy-key-for-scanning"
     else:
         if model_name.startswith("openai:"):
-            return os.getenv("OPENAI_API_KEY")
+            return os.getenv("OPENAI_API_KEY", "dummy-key-for-scanning")
         elif model_name.startswith("anthropic:"):
-            return os.getenv("ANTHROPIC_API_KEY")
+            return os.getenv("ANTHROPIC_API_KEY", "dummy-key-for-scanning")
         elif model_name.startswith("google"):
-            return os.getenv("GOOGLE_API_KEY")
+            return os.getenv("GOOGLE_API_KEY", "dummy-key-for-scanning")
         elif model_name.startswith("openrouter:"):
-            return os.getenv("OPENROUTER_API_KEY")
-        return None
+            return os.getenv("OPENROUTER_API_KEY", "dummy-key-for-scanning")
+        return "dummy-key-for-scanning"
 
 def get_tavily_api_key(config: RunnableConfig):
     """Get Tavily API key from environment or config."""
