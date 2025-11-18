@@ -47,3 +47,7 @@ commandFunction: |-
 exampleConfig:
   tavilyApiKey: "tvly-example123"
   openrouterApiKey: "sk-or-example123"
+
+testConfig:
+  tavilyApiKey: "${TAVILY_API_KEY}"
+  openrouterApiKey: "${OPENROUTER_API_KEY}"
