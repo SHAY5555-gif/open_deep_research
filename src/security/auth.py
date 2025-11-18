@@ -23,6 +23,7 @@ async def get_current_user(authorization: str | None) -> Auth.types.MinimalUserD
     """Check if the user's JWT token is valid using Supabase."""
 
     # TEMPORARY: Allow local development without Supabase
+    # Also allow MCP endpoint requests without authentication for Smithery deployment
     if not supabase:
         return {
             "identity": "local-dev-user",
