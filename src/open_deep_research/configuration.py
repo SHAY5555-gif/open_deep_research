@@ -10,15 +10,18 @@ from pydantic import BaseModel, Field
 
 class SearchAPI(Enum):
     """Enumeration of available search API providers."""
-    
+
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     TAVILY = "tavily"
+    BRIGHTDATA = "brightdata"
+    FIRECRAWL = "firecrawl"
+    PERPLEXITY = "perplexity"
     NONE = "none"
 
 class MCPConfig(BaseModel):
     """Configuration for Model Context Protocol (MCP) servers."""
-    
+
     url: Optional[str] = Field(
         default=None,
         optional=True,
@@ -34,6 +37,20 @@ class MCPConfig(BaseModel):
         optional=True,
     )
     """Whether the MCP server requires authentication"""
+
+
+class FilesystemConfig(BaseModel):
+    """Configuration for local filesystem access."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable filesystem access for reading local code files"
+    )
+    allowed_paths: Optional[List[str]] = Field(
+        default=None,
+        description="List of directory paths the agent can access (e.g., ['/path/to/project'])"
+    )
+    """List of allowed directory paths for filesystem access"""
 
 class Configuration(BaseModel):
     """Main configuration class for the Deep Research agent."""
@@ -62,11 +79,11 @@ class Configuration(BaseModel):
         }
     )
     max_concurrent_research_units: int = Field(
-        default=5,
+        default=10,
         metadata={
             "x_oap_ui_config": {
                 "type": "slider",
-                "default": 5,
+                "default": 10,
                 "min": 1,
                 "max": 20,
                 "step": 1,
@@ -74,16 +91,19 @@ class Configuration(BaseModel):
             }
         }
     )
-    # Research Configuration
+    # Research Configuration - Using FireCrawl as default for Cerebras
     search_api: SearchAPI = Field(
-        default=SearchAPI.TAVILY,
+        default=SearchAPI.FIRECRAWL,
         metadata={
             "x_oap_ui_config": {
                 "type": "select",
-                "default": "tavily",
-                "description": "Search API to use for research. NOTE: Make sure your Researcher Model supports the selected search API.",
+                "default": "firecrawl",
+                "description": "Search API to use for research. FireCrawl is configured as default provider. NOTE: Make sure your Researcher Model supports the selected search API.",
                 "options": [
                     {"label": "Tavily", "value": SearchAPI.TAVILY.value},
+                    {"label": "FireCrawl", "value": SearchAPI.FIRECRAWL.value},
+                    {"label": "BrightData", "value": SearchAPI.BRIGHTDATA.value},
+                    {"label": "Perplexity (Fast & Focused)", "value": SearchAPI.PERPLEXITY.value},
                     {"label": "OpenAI Native Web Search", "value": SearchAPI.OPENAI.value},
                     {"label": "Anthropic Native Web Search", "value": SearchAPI.ANTHROPIC.value},
                     {"label": "None", "value": SearchAPI.NONE.value}
@@ -117,14 +137,14 @@ class Configuration(BaseModel):
             }
         }
     )
-    # Model Configuration
+    # Model Configuration - Using Cerebras GLM-4.6 directly
     summarization_model: str = Field(
-        default="openrouter:z-ai/glm-4.6",
+        default="cerebras:zai-glm-4.6",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "openrouter:z-ai/glm-4.6",
-                "description": "Model for summarizing research results from Tavily search results"
+                "default": "cerebras:zai-glm-4.6",
+                "description": "Model for summarizing research results from search results"
             }
         }
     )
@@ -151,62 +171,62 @@ class Configuration(BaseModel):
         }
     )
     research_model: str = Field(
-        default="openrouter:z-ai/glm-4.6",
+        default="cerebras:zai-glm-4.6",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "openrouter:z-ai/glm-4.6",
+                "default": "cerebras:zai-glm-4.6",
                 "description": "Model for conducting research. NOTE: Make sure your Researcher Model supports the selected search API."
             }
         }
     )
     research_model_max_tokens: int = Field(
-        default=10000,
+        default=40000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 10000,
-                "description": "Maximum output tokens for research model"
+                "default": 40000,
+                "description": "Maximum output tokens for research model (Cerebras GLM-4.6 max output: 40K)"
             }
         }
     )
     compression_model: str = Field(
-        default="openrouter:z-ai/glm-4.6",
+        default="cerebras:zai-glm-4.6",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "openrouter:z-ai/glm-4.6",
-                "description": "Model for compressing research findings from sub-agents. NOTE: Make sure your Compression Model supports the selected search API."
+                "default": "cerebras:zai-glm-4.6",
+                "description": "Model for compressing research findings from sub-agents."
             }
         }
     )
     compression_model_max_tokens: int = Field(
-        default=8192,
+        default=16384,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 8192,
+                "default": 16384,
                 "description": "Maximum output tokens for compression model"
             }
         }
     )
     final_report_model: str = Field(
-        default="openrouter:z-ai/glm-4.6",
+        default="cerebras:zai-glm-4.6",
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "openrouter:z-ai/glm-4.6",
+                "default": "cerebras:zai-glm-4.6",
                 "description": "Model for writing the final report from all research findings"
             }
         }
     )
     final_report_model_max_tokens: int = Field(
-        default=10000,
+        default=40000,
         metadata={
             "x_oap_ui_config": {
                 "type": "number",
-                "default": 10000,
-                "description": "Maximum output tokens for final report model"
+                "default": 40000,
+                "description": "Maximum output tokens for final report model (Cerebras GLM-4.6 max output: 40K)"
             }
         }
     )
@@ -231,19 +251,43 @@ class Configuration(BaseModel):
             }
         }
     )
+    # Filesystem configuration for local code access
+    filesystem_config: Optional[FilesystemConfig] = Field(
+        default=None,
+        optional=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "object",
+                "description": "Configuration for local filesystem access. Enable to allow the agent to read and analyze local code files."
+            }
+        }
+    )
 
 
     @classmethod
     def from_runnable_config(
         cls, config: Optional[RunnableConfig] = None
     ) -> "Configuration":
-        """Create a Configuration instance from a RunnableConfig."""
+        """Create a Configuration instance from a RunnableConfig.
+
+        Priority order: configurable (API request) > environment variable > default
+        """
         configurable = config.get("configurable", {}) if config else {}
         field_names = list(cls.model_fields.keys())
-        values: dict[str, Any] = {
-            field_name: os.environ.get(field_name.upper(), configurable.get(field_name))
-            for field_name in field_names
-        }
+
+        # Build values with correct priority: configurable > env > default
+        values: dict[str, Any] = {}
+        for field_name in field_names:
+            # First try configurable (from API request)
+            config_value = configurable.get(field_name)
+            if config_value is not None:
+                values[field_name] = config_value
+            else:
+                # Fall back to environment variable
+                env_value = os.environ.get(field_name.upper())
+                if env_value is not None:
+                    values[field_name] = env_value
+
         return cls(**{k: v for k, v in values.items() if v is not None})
 
     class Config:

@@ -29,10 +29,12 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.config import get_store
 from mcp import McpError
 from tavily import AsyncTavilyClient
-from brightdata import bdclient
 from firecrawl import AsyncFirecrawl
 
-from open_deep_research.configuration import Configuration, SearchAPI
+# Note: brightdata.bdclient is imported lazily in brightdata_search_async() to avoid
+# import errors when the package version doesn't have the bdclient export
+
+from open_deep_research.configuration import Configuration, FilesystemConfig, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
 
@@ -146,22 +148,39 @@ async def brightdata_search_async(
             "BrightData API token not configured. Please provide a valid BRIGHTDATA_API_TOKEN to use this search tool."
         )
 
-    # Initialize the BrightData client with API token and SERP zone from config
-    serp_zone = os.getenv("SERP_ZONE")
-    print(f"[BRIGHTDATA] Initializing BrightData client with API token: {api_token[:20]}... and SERP zone: {serp_zone}")
-    client = bdclient(api_token=api_token, serp_zone=serp_zone)
+    # Lazy import of BrightData client
+    try:
+        from brightdata import bdclient
+    except ImportError:
+        raise ToolException(
+            "BrightData SDK not properly installed. Please install with: pip install brightdata-sdk>=1.1.0"
+        )
+
+    # Initialize the BrightData client with API token and SERP zone
+    serp_zone = os.getenv("SERP_ZONE", "serp_api1")
+    print(f"[BRIGHTDATA] Initializing bdclient with SERP zone: {serp_zone}")
+
+    try:
+        client = bdclient(
+            api_token=api_token,
+            serp_zone=serp_zone
+        )
+    except Exception as e:
+        # Fallback: try with just API token
+        print(f"[BRIGHTDATA] Failed to init with serp_zone, trying without: {e}")
+        client = bdclient(api_token=api_token)
 
     # Execute searches for each query
     search_results = []
     for query in search_queries:
         try:
-            # Use BrightData SDK search function
-            print(f"[BRIGHTDATA] Searching for: {query}")
-            results = client.search(query=query)
-
-            # Parse results using BrightData's parser
-            parsed_results = client.parse_content(results)
-            print(f"[BRIGHTDATA] Successfully received {len(parsed_results.get('organic_results', []))} results for query: {query}")
+            # Use BrightData SDK Google search with parse=True for structured results
+            print(f"[BRIGHTDATA] Searching Google for: {query}")
+            results = client.search(
+                query=query,
+                search_engine='google',
+                parse=True  # Get parsed results instead of raw HTML
+            )
 
             # Format to match expected structure
             formatted_result = {
@@ -169,16 +188,32 @@ async def brightdata_search_async(
                 'results': []
             }
 
-            # Extract search results from parsed content
-            if isinstance(parsed_results, dict):
-                organic_results = parsed_results.get('organic_results', [])
-                for i, item in enumerate(organic_results[:max_results]):
+            # Handle the results - when parse=True, results is a dict with 'organic' key
+            if isinstance(results, dict):
+                organic_results = results.get('organic', results.get('results', []))
+                if organic_results:
+                    print(f"[BRIGHTDATA] Successfully received {len(organic_results)} results for query: {query}")
+                    for i, item in enumerate(organic_results[:max_results]):
+                        formatted_result['results'].append({
+                            'url': item.get('link', item.get('url', '')),
+                            'title': item.get('title', ''),
+                            'content': item.get('snippet', item.get('description', '')),
+                            'score': 1.0 - (i * 0.1)  # Simple scoring based on position
+                        })
+                else:
+                    print(f"[BRIGHTDATA] No organic results for query '{query}'. Keys: {results.keys()}")
+            elif isinstance(results, list):
+                # Handle list response format
+                print(f"[BRIGHTDATA] Successfully received {len(results)} results for query: {query}")
+                for i, item in enumerate(results[:max_results]):
                     formatted_result['results'].append({
-                        'url': item.get('url', ''),
+                        'url': item.get('link', item.get('url', '')),
                         'title': item.get('title', ''),
-                        'content': item.get('description', '') + ' ' + item.get('snippet', ''),
-                        'score': 1.0 - (i * 0.1)  # Simple scoring based on position
+                        'content': item.get('snippet', item.get('description', '')),
+                        'score': 1.0 - (i * 0.1)
                     })
+            else:
+                print(f"[BRIGHTDATA] Unexpected results type for query '{query}': {type(results)}")
 
             search_results.append(formatted_result)
         except Exception as e:
@@ -341,6 +376,109 @@ async def firecrawl_search_async(
             search_results.append({'query': query, 'results': []})
 
     return search_results
+
+##########################
+# Perplexity Search Tool Utils
+##########################
+PERPLEXITY_SEARCH_DESCRIPTION = (
+    "A fast, AI-powered search engine that provides focused and accurate answers with citations. "
+    "Excellent for technical documentation, debugging issues, and getting quick, reliable answers. "
+    "Use this for code-related questions, library documentation, and solving programming problems."
+)
+
+@tool(description=PERPLEXITY_SEARCH_DESCRIPTION)
+async def perplexity_search(
+    queries: List[str],
+    config: RunnableConfig = None
+) -> str:
+    """Fetch focused answers from Perplexity AI search API.
+
+    Args:
+        queries: List of search queries to execute
+        config: Runtime configuration for API keys and model settings
+
+    Returns:
+        Formatted string containing Perplexity's AI-generated answers with citations
+    """
+    print(f"[PERPLEXITY] perplexity_search called with {len(queries)} queries: {queries}")
+
+    # Get API key and validate
+    api_key = get_perplexity_api_key(config)
+    if api_key == "dummy-key-for-scanning":
+        raise ToolException(
+            "Perplexity API key not configured. Please provide a valid PERPLEXITY_API_KEY to use this search tool."
+        )
+
+    # Execute searches for each query
+    search_results = []
+    async with aiohttp.ClientSession() as session:
+        for query in queries:
+            try:
+                print(f"[PERPLEXITY] Searching for: {query}")
+
+                # Call Perplexity API
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                }
+
+                payload = {
+                    "model": "sonar",
+                    "messages": [
+                        {"role": "user", "content": query}
+                    ],
+                    "return_citations": True,
+                    "search_recency_filter": "month"
+                }
+
+                async with session.post(
+                    "https://api.perplexity.ai/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        citations = result.get("citations", [])
+
+                        search_results.append({
+                            "query": query,
+                            "content": content,
+                            "citations": citations
+                        })
+                        print(f"[PERPLEXITY] Successfully received response for query: {query}")
+                    else:
+                        error_text = await response.text()
+                        print(f"[PERPLEXITY] Error for query '{query}': {response.status} - {error_text}")
+                        search_results.append({
+                            "query": query,
+                            "content": f"Error: {response.status}",
+                            "citations": []
+                        })
+
+            except Exception as e:
+                print(f"[PERPLEXITY] Exception for query '{query}': {e}")
+                search_results.append({
+                    "query": query,
+                    "content": f"Error: {str(e)}",
+                    "citations": []
+                })
+
+    # Format output
+    formatted_output = "Perplexity Search Results:\n\n"
+    for result in search_results:
+        formatted_output += f"**Query:** {result['query']}\n"
+        formatted_output += f"**Answer:**\n{result['content']}\n"
+
+        if result.get('citations'):
+            formatted_output += "\n**Sources:**\n"
+            for i, citation in enumerate(result['citations'], 1):
+                formatted_output += f"[{i}] {citation}\n"
+
+        formatted_output += "\n" + "-" * 80 + "\n"
+
+    return formatted_output
 
 ##########################
 # Tavily Search Tool Utils
@@ -527,6 +665,172 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
+
+##########################
+# Filesystem Tool Utils
+##########################
+
+def create_filesystem_tools(allowed_paths: List[str]) -> List[BaseTool]:
+    """Create filesystem tools with path restrictions.
+
+    Args:
+        allowed_paths: List of directory paths the tools can access
+
+    Returns:
+        List of filesystem tools (list_directory, read_file, search_files)
+    """
+    import glob as glob_module
+    from pathlib import Path
+
+    def is_path_allowed(path: str) -> bool:
+        """Check if a path is within the allowed directories."""
+        if not allowed_paths:
+            return False
+        target = Path(path).resolve()
+        for allowed in allowed_paths:
+            allowed_path = Path(allowed).resolve()
+            try:
+                target.relative_to(allowed_path)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    @tool(description="List files and directories in a specified path. Use this to explore the codebase structure.")
+    def list_directory(path: str) -> str:
+        """List contents of a directory.
+
+        Args:
+            path: The directory path to list
+
+        Returns:
+            List of files and directories with their types
+        """
+        if not is_path_allowed(path):
+            return f"Error: Path '{path}' is not in the allowed directories. Allowed: {allowed_paths}"
+
+        try:
+            target = Path(path)
+            if not target.exists():
+                return f"Error: Path '{path}' does not exist."
+            if not target.is_dir():
+                return f"Error: '{path}' is not a directory."
+
+            items = []
+            for item in sorted(target.iterdir()):
+                item_type = "[DIR]" if item.is_dir() else "[FILE]"
+                items.append(f"{item_type} {item.name}")
+
+            if not items:
+                return f"Directory '{path}' is empty."
+
+            return f"Contents of {path}:\n" + "\n".join(items)
+        except Exception as e:
+            return f"Error listing directory: {str(e)}"
+
+    @tool(description="Read the contents of a file. Use this to understand code implementation.")
+    def read_file(
+        path: str,
+        start_line: int = 1,
+        max_lines: int = 200
+    ) -> str:
+        """Read contents of a file with optional line range.
+
+        Args:
+            path: The file path to read
+            start_line: Line number to start reading from (1-indexed)
+            max_lines: Maximum number of lines to read (default 200)
+
+        Returns:
+            File contents with line numbers
+        """
+        if not is_path_allowed(path):
+            return f"Error: Path '{path}' is not in the allowed directories. Allowed: {allowed_paths}"
+
+        try:
+            target = Path(path)
+            if not target.exists():
+                return f"Error: File '{path}' does not exist."
+            if not target.is_file():
+                return f"Error: '{path}' is not a file."
+
+            # Read file with encoding handling
+            try:
+                content = target.read_text(encoding='utf-8')
+            except UnicodeDecodeError:
+                content = target.read_text(encoding='latin-1')
+
+            lines = content.split('\n')
+            total_lines = len(lines)
+
+            # Adjust indices (convert 1-indexed to 0-indexed)
+            start_idx = max(0, start_line - 1)
+            end_idx = min(start_idx + max_lines, total_lines)
+
+            selected_lines = lines[start_idx:end_idx]
+
+            # Format with line numbers
+            formatted_lines = []
+            for i, line in enumerate(selected_lines, start=start_idx + 1):
+                formatted_lines.append(f"{i:4d}| {line}")
+
+            result = f"File: {path} (lines {start_idx + 1}-{end_idx} of {total_lines})\n"
+            result += "-" * 60 + "\n"
+            result += "\n".join(formatted_lines)
+
+            if end_idx < total_lines:
+                result += f"\n\n... {total_lines - end_idx} more lines. Use start_line={end_idx + 1} to continue reading."
+
+            return result
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+
+    @tool(description="Search for files matching a pattern. Use glob patterns like '**/*.py' for recursive search.")
+    def search_files(
+        directory: str,
+        pattern: str,
+        max_results: int = 50
+    ) -> str:
+        """Search for files matching a glob pattern.
+
+        Args:
+            directory: The directory to search in
+            pattern: Glob pattern (e.g., '*.py', '**/*.ts', '**/test_*.py')
+            max_results: Maximum number of results to return
+
+        Returns:
+            List of matching file paths
+        """
+        if not is_path_allowed(directory):
+            return f"Error: Path '{directory}' is not in the allowed directories. Allowed: {allowed_paths}"
+
+        try:
+            target = Path(directory)
+            if not target.exists():
+                return f"Error: Directory '{directory}' does not exist."
+            if not target.is_dir():
+                return f"Error: '{directory}' is not a directory."
+
+            # Find matching files
+            matches = list(target.glob(pattern))[:max_results]
+
+            if not matches:
+                return f"No files found matching '{pattern}' in '{directory}'."
+
+            # Format results
+            results = [str(m.relative_to(target)) for m in matches]
+
+            output = f"Found {len(matches)} file(s) matching '{pattern}':\n"
+            output += "\n".join(f"  {r}" for r in results)
+
+            if len(matches) == max_results:
+                output += f"\n\n(Limited to {max_results} results)"
+
+            return output
+        except Exception as e:
+            return f"Error searching files: {str(e)}"
+
+    return [list_directory, read_file, search_files]
 
 ##########################
 # Reflection Tool Utils
@@ -806,6 +1110,8 @@ async def load_mcp_tools(
                 "sse_read_timeout": timedelta(seconds=60),
             }
 
+    # Note: Perplexity uses a direct API tool (perplexity_search) instead of MCP
+
     # Step 2: Add user-configured MCP server if provided
     if configurable.mcp_config and configurable.mcp_config.url and configurable.mcp_config.tools:
         # Handle authentication if required
@@ -892,9 +1198,13 @@ async def get_search_tool(search_api: SearchAPI):
         return [{"type": "web_search_preview"}]
 
     elif search_api == SearchAPI.BRIGHTDATA:
-        # BrightData tools are loaded via MCP in load_mcp_tools()
-        # No need to return search tools here as they come from MCP
-        return []
+        # BrightData SDK search tool for web research
+        search_tool = brightdata_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}),
+            "tool_description": "Search tool using BrightData SDK for enterprise-grade web data collection"
+        }
+        return [search_tool]
 
     elif search_api == SearchAPI.FIRECRAWL:
         # Configure FireCrawl search tool with metadata
@@ -902,6 +1212,15 @@ async def get_search_tool(search_api: SearchAPI):
         search_tool.metadata = {
             **(search_tool.metadata or {}),
             "tool_description": "Search tool using FireCrawl API for comprehensive web research"
+        }
+        return [search_tool]
+
+    elif search_api == SearchAPI.PERPLEXITY:
+        # Configure Perplexity search tool - fast and focused for technical queries
+        search_tool = perplexity_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}),
+            "tool_description": "Fast AI-powered search for technical documentation, debugging, and focused answers"
         }
         return [search_tool]
 
@@ -923,33 +1242,41 @@ async def get_search_tool(search_api: SearchAPI):
     return []
     
 async def get_all_tools(config: RunnableConfig):
-    """Assemble complete toolkit including research, search, and MCP tools.
-    
+    """Assemble complete toolkit including research, search, filesystem, and MCP tools.
+
     Args:
         config: Runtime configuration specifying search API and MCP settings
-        
+
     Returns:
         List of all configured and available tools for research operations
     """
     # Start with core research tools
     tools = [tool(ResearchComplete), think_tool]
-    
+
     # Add configured search tools
     configurable = Configuration.from_runnable_config(config)
     search_api = SearchAPI(get_config_value(configurable.search_api))
     search_tools = await get_search_tool(search_api)
     tools.extend(search_tools)
-    
+
+    # Add filesystem tools if configured
+    if configurable.filesystem_config and configurable.filesystem_config.enabled:
+        allowed_paths = configurable.filesystem_config.allowed_paths or []
+        if allowed_paths:
+            filesystem_tools = create_filesystem_tools(allowed_paths)
+            tools.extend(filesystem_tools)
+            print(f"[TOOLS] Added filesystem tools for paths: {allowed_paths}")
+
     # Track existing tool names to prevent conflicts
     existing_tool_names = {
-        tool.name if hasattr(tool, "name") else tool.get("name", "web_search") 
+        tool.name if hasattr(tool, "name") else tool.get("name", "web_search")
         for tool in tools
     }
-    
+
     # Add MCP tools if configured
     mcp_tools = await load_mcp_tools(config, existing_tool_names)
     tools.extend(mcp_tools)
-    
+
     return tools
 
 def get_notes_from_tool_calls(messages: list[MessageLikeRepresentation]):
@@ -1141,7 +1468,11 @@ def _check_gemini_token_limit(exception: Exception, error_str: str) -> bool:
     return False
 
 # NOTE: This may be out of date or not applicable to your models. Please update this as needed.
+# Context = input window, Max Output = max completion tokens
 MODEL_TOKEN_LIMITS = {
+    # Cerebras models (context limits, not output limits)
+    "cerebras:zai-glm-4.6": 131000,  # Context: 64K (Free) / 131K (Paid)
+    # OpenAI models
     "openai:gpt-4.1-mini": 1047576,
     "openai:gpt-4.1-nano": 1047576,
     "openai:gpt-4.1": 1047576,
@@ -1250,24 +1581,52 @@ def init_model_with_openrouter(
     max_tokens: int = None,
     api_key: str = None,
     tags: List[str] = None,
-    provider: str = "Cerebras"
+    provider: str = "Cerebras",
+    temperature: float = 1.0
 ) -> BaseChatModel:
-    """Initialize a chat model with OpenRouter support and optional provider routing.
+    """Initialize a chat model with OpenRouter, Cerebras, or standard provider support.
 
     Args:
-        model: Model string in format "openrouter:provider/model-name" or "provider:model-name"
+        model: Model string in format "cerebras:model-name", "openrouter:provider/model-name" or "provider:model-name"
         max_tokens: Maximum tokens for model output
         api_key: API key for the model provider
         tags: Optional tags for LangSmith tracking
         provider: Hardware provider for OpenRouter (default: "Cerebras")
+        temperature: Temperature for model generation (default: 1.0 for Cerebras GLM-4.6)
 
     Returns:
         Initialized chat model instance
     """
     model_lower = model.lower()
 
+    # Check if this is a Cerebras direct model
+    if model_lower.startswith("cerebras:"):
+        # Extract the actual model name (remove "cerebras:" prefix)
+        actual_model_name = model[len("cerebras:"):]
+
+        # Configure model parameters for Cerebras OpenAI-compatible API
+        model_params = {
+            "model": actual_model_name,
+            "openai_api_key": api_key,
+            "openai_api_base": "https://api.cerebras.ai/v1",
+            "temperature": temperature,
+        }
+
+        # Add max_tokens if specified (Cerebras GLM-4.6 max output: 40K tokens)
+        if max_tokens:
+            model_params["max_tokens"] = min(max_tokens, 40000)
+
+        # Add tags if specified
+        if tags:
+            model_params["tags"] = tags
+
+        print(f"[CEREBRAS] Initializing model: {actual_model_name} with max_tokens={model_params.get('max_tokens')}")
+
+        # Initialize ChatOpenAI with Cerebras configuration
+        return ChatOpenAI(**model_params)
+
     # Check if this is an OpenRouter model
-    if model_lower.startswith("openrouter:"):
+    elif model_lower.startswith("openrouter:"):
         # Extract the actual model name (remove "openrouter:" prefix)
         actual_model_name = model[len("openrouter:"):]
 
@@ -1322,7 +1681,9 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
         api_keys = config.get("configurable", {}).get("apiKeys", {})
         if not api_keys:
             return "dummy-key-for-scanning"
-        if model_name.startswith("openai:"):
+        if model_name.startswith("cerebras:"):
+            return api_keys.get("CEREBRAS_API_KEY", os.getenv("CEREBRAS_API_KEY", "dummy-key-for-scanning"))
+        elif model_name.startswith("openai:"):
             return api_keys.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "dummy-key-for-scanning"))
         elif model_name.startswith("anthropic:"):
             return api_keys.get("ANTHROPIC_API_KEY", os.getenv("ANTHROPIC_API_KEY", "dummy-key-for-scanning"))
@@ -1330,9 +1691,13 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", "dummy-key-for-scanning"))
         elif model_name.startswith("openrouter:"):
             return api_keys.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "dummy-key-for-scanning"))
+        elif model_name.startswith("xai:") or "grok" in model_name:
+            return api_keys.get("XAI_API_KEY", os.getenv("XAI_API_KEY", "dummy-key-for-scanning"))
         return "dummy-key-for-scanning"
     else:
-        if model_name.startswith("openai:"):
+        if model_name.startswith("cerebras:"):
+            return os.getenv("CEREBRAS_API_KEY", "dummy-key-for-scanning")
+        elif model_name.startswith("openai:"):
             return os.getenv("OPENAI_API_KEY", "dummy-key-for-scanning")
         elif model_name.startswith("anthropic:"):
             return os.getenv("ANTHROPIC_API_KEY", "dummy-key-for-scanning")
@@ -1340,6 +1705,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return os.getenv("GOOGLE_API_KEY", "dummy-key-for-scanning")
         elif model_name.startswith("openrouter:"):
             return os.getenv("OPENROUTER_API_KEY", "dummy-key-for-scanning")
+        elif model_name.startswith("xai:") or "grok" in model_name:
+            return os.getenv("XAI_API_KEY", "dummy-key-for-scanning")
         return "dummy-key-for-scanning"
 
 def get_tavily_api_key(config: RunnableConfig):
@@ -1374,3 +1741,25 @@ def get_firecrawl_api_key(config: RunnableConfig):
         return api_keys.get("FIRECRAWL_API_KEY", os.getenv("FIRECRAWL_API_KEY", "dummy-key-for-scanning"))
     else:
         return os.getenv("FIRECRAWL_API_KEY", "dummy-key-for-scanning")
+
+def get_perplexity_api_key(config: RunnableConfig):
+    """Get Perplexity API key from environment or config."""
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        api_keys = config.get("configurable", {}).get("apiKeys", {})
+        if not api_keys:
+            return os.getenv("PERPLEXITY_API_KEY", "dummy-key-for-scanning")
+        return api_keys.get("PERPLEXITY_API_KEY", os.getenv("PERPLEXITY_API_KEY", "dummy-key-for-scanning"))
+    else:
+        return os.getenv("PERPLEXITY_API_KEY", "dummy-key-for-scanning")
+
+def get_cerebras_api_key(config: RunnableConfig):
+    """Get Cerebras API key from environment or config."""
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        api_keys = config.get("configurable", {}).get("apiKeys", {})
+        if not api_keys:
+            return os.getenv("CEREBRAS_API_KEY", "dummy-key-for-scanning")
+        return api_keys.get("CEREBRAS_API_KEY", os.getenv("CEREBRAS_API_KEY", "dummy-key-for-scanning"))
+    else:
+        return os.getenv("CEREBRAS_API_KEY", "dummy-key-for-scanning")

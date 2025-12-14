@@ -1,0 +1,35 @@
+{
+  "name": "@open-deep-research/cerebras-firecrawl-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server for Cerebras + Firecrawl Deep Research Agent",
+  "main": "index.js",
+  "bin": {
+    "cerebras-firecrawl-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "cerebras",
+    "firecrawl",
+    "deep-research",
+    "ai-research",
+    "web-scraping"
+  ],
+  "author": "Open Deep Research",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/langchain-ai/open_deep_research"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ]
+}

@@ -9,26 +9,43 @@ These are the messages that have been exchanged so far from the user asking for 
 Today's date is {date}.
 
 Assess whether you need to ask a clarifying question, or if the user has already provided enough information for you to start research.
-IMPORTANT: If you can see in the messages history that you have already asked a clarifying question, you almost always do not need to ask another one. Only ask another question if ABSOLUTELY NECESSARY.
 
-If there are acronyms, abbreviations, or unknown terms, ask the user to clarify.
-If you need to ask a question, follow these guidelines:
-- Be concise while gathering all necessary information
-- Make sure to gather all the information needed to carry out the research task in a concise, well-structured manner.
-- Use bullet points or numbered lists if appropriate for clarity. Make sure that this uses markdown formatting and will be rendered correctly if the string output is passed to a markdown renderer.
-- Don't ask for unnecessary information, or information that the user has already provided. If you can see that the user has already provided the information, do not ask for it again.
+CRITICAL RULES - FOLLOW STRICTLY:
+1. **ONE QUESTION MAXIMUM**: You may ask AT MOST ONE clarifying question per research session. If you already asked a question in the message history, you MUST NOT ask another one - proceed with research immediately.
+
+2. **USER SAYS "I DON'T KNOW" or SIMILAR**: If the user responds with ANY of these:
+   - "I don't know", "not sure", "no idea", "לא יודע", "אני לא יודע"
+   - "just research it", "figure it out", "whatever you think", "continue", "proceed"
+   - Any indication they want you to proceed without more information
+   → You MUST proceed with research immediately. Set need_clarification to FALSE.
+
+3. **ALREADY ASKED A QUESTION**: If you can see in the message history that:
+   - You already asked ANY clarifying question, OR
+   - The user responded to a clarifying question (even with "I don't know")
+   → You MUST proceed with research immediately. Set need_clarification to FALSE.
+
+4. **BIAS TOWARDS ACTION**: When in doubt, START RESEARCHING. The user came for research, not for questions. Only ask if the request is completely ambiguous with multiple very different possible interpretations.
+
+Only ask a clarifying question if:
+- The request is genuinely ambiguous (could mean very different things)
+- You have NOT already asked any question in this conversation
+- The user has NOT expressed any desire to proceed
+
+If you need to ask a question (RARE):
+- Be concise - ONE short question only
+- Use bullet points if needed for clarity
 
 Respond in valid JSON format with these exact keys:
 "need_clarification": boolean,
 "question": "<question to ask the user to clarify the report scope>",
 "verification": "<verification message that we will start research>"
 
-If you need to ask a clarifying question, return:
+If you need to ask a clarifying question (RARE - only if truly ambiguous AND no prior questions):
 "need_clarification": true,
-"question": "<your clarifying question>",
+"question": "<your ONE clarifying question>",
 "verification": ""
 
-If you do not need to ask a clarifying question, return:
+If you do NOT need to ask a clarifying question (DEFAULT in most cases):
 "need_clarification": false,
 "question": "",
 "verification": "<acknowledgement message that you will now start research based on the provided information>"
@@ -143,29 +160,61 @@ You can use any of the tools provided to you to find resources that can help ans
 </Task>
 
 <Available Tools>
-You have access to two main tools:
-1. **tavily_search**: For conducting web searches to gather information
-2. **think_tool**: For reflection and strategic planning during research
+You have access to the following tools:
+
+**Search Tools** (use one of these for web research):
+- **perplexity_search**: Fast, AI-powered search - best for technical documentation, debugging, and focused answers
+- **tavily_search**: Comprehensive web search - good for general research and current events
+- **firecrawl_search**: Web scraping search - extracts full page content in markdown
+
+**Filesystem Tools** (if enabled - for analyzing local code):
+- **list_directory**: Explore directory structure
+- **read_file**: Read file contents with line numbers
+- **search_files**: Find files matching glob patterns (e.g., '**/*.py')
+
+**Reflection Tool**:
+- **think_tool**: For strategic reflection and planning
+
 {mcp_prompt}
 
-**CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with the tavily_search or any other tools. It should be to reflect on the results of the search.**
+**CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with other tools in parallel.**
 </Available Tools>
+
+<Strategy for Effective Research>
+
+**For Code/Technical Questions:**
+1. If filesystem tools are available, start by exploring the codebase structure
+2. Use search_files to find relevant files (e.g., '**/*.py' for Python files)
+3. Use read_file to understand implementation details
+4. Use perplexity_search for documentation, error solutions, or API references
+
+**For General Research:**
+1. Start with broader search queries
+2. Narrow down based on initial results
+3. Cross-reference multiple sources
+
+**For Debugging/Problem Solving:**
+1. Search for the exact error message first
+2. Include library/framework version in queries
+3. Look for Stack Overflow, GitHub issues, or official docs
+</Strategy>
 
 <Instructions>
 Think like a human researcher with limited time. Follow these steps:
 
 1. **Read the question carefully** - What specific information does the user need?
-2. **Start with broader searches** - Use broad, comprehensive queries first
-3. **After each search, pause and assess** - Do I have enough to answer? What's still missing?
-4. **Execute narrower searches as you gather information** - Fill in the gaps
-5. **Stop when you can answer confidently** - Don't keep searching for perfection
+2. **Choose the right tool** - Use filesystem tools for local code, search for web info
+3. **Start with broader searches** - Use broad, comprehensive queries first
+4. **After each action, pause and assess** - Do I have enough to answer? What's still missing?
+5. **Execute narrower searches as you gather information** - Fill in the gaps
+6. **Stop when you can answer confidently** - Don't keep searching for perfection
 </Instructions>
 
 <Hard Limits>
-**Tool Call Budgets** (Prevent excessive searching):
-- **Simple queries**: Use 2-3 search tool calls maximum
-- **Complex queries**: Use up to 5 search tool calls maximum
-- **Always stop**: After 5 search tool calls if you cannot find the right sources
+**Tool Call Budgets** (Prevent excessive tool usage):
+- **Simple queries**: Use 2-3 tool calls maximum
+- **Complex queries**: Use up to 5 tool calls maximum
+- **Always stop**: After 5 tool calls if you cannot find the right sources
 
 **Stop Immediately When**:
 - You can answer the user's question comprehensively
@@ -174,11 +223,11 @@ Think like a human researcher with limited time. Follow these steps:
 </Hard Limits>
 
 <Show Your Thinking>
-After each search tool call, use think_tool to analyze the results:
+After each tool call, use think_tool to analyze the results:
 - What key information did I find?
 - What's missing?
 - Do I have enough to answer the question comprehensively?
-- Should I search more or provide my answer?
+- Should I continue or provide my answer?
 </Show Your Thinking>
 """
 

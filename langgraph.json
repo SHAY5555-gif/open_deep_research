@@ -17,6 +17,18 @@
             "topic"
           ]
         }
+      },
+      "Cerebras GitHub Researcher": {
+        "path": "./src/open_deep_research/grok_github_researcher.py:grok_github_researcher",
+        "description": "Cerebras-powered ULTRA-FAST deep researcher with GitHub MCP and FireCrawl SDK. Uses Cerebras GLM-4.6 for blazing fast inference with 2M context window for investigating bugs and code."
+      },
+      "Cerebras Firecrawl Researcher": {
+        "path": "./src/open_deep_research/cerebras_firecrawl_researcher.py:cerebras_firecrawl_researcher",
+        "description": "Deep research agent using Cerebras AI for ultra-fast inference and Firecrawl SDK for comprehensive web scraping. Includes search, scrape, crawl, map, and extract tools."
+      },
+      "Cerebras BrightData Researcher": {
+        "path": "./src/open_deep_research/cerebras_brightdata_researcher.py:cerebras_brightdata_researcher",
+        "description": "Deep research agent using Cerebras AI for ultra-fast inference and BrightData SDK for enterprise-grade web data collection. Includes Google/Bing search, scraping with anti-bot bypass, crawling, AI extraction, and LinkedIn search."
       }
     },
     "python_version": "3.11",

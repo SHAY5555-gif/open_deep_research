@@ -1,16 +1,19 @@
-"""Lightweight wrapper graph for exposing Deep Research over MCP."""
+"""Graph wrapper that exposes Deep Research as a single-topic MCP tool."""
 
 from typing import List
 
 from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_core.pydantic_v1 import BaseModel, Field
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
 
-from open_deep_research.deep_researcher import deep_researcher
+from open_deep_research.configuration import Configuration
+from open_deep_research.deep_researcher import AgentInputState, deep_researcher
 
 
-class DeepResearchInput(BaseModel):
-    """Schema for MCP callers."""
+class TopicInput(BaseModel):
+    """Schema exposed to MCP callers."""
 
     topic: str = Field(
         ...,
@@ -18,34 +21,49 @@ class DeepResearchInput(BaseModel):
     )
 
 
-class DeepResearchOutput(BaseModel):
-    """Structured output returned to MCP callers."""
+class TopicState(TypedDict):
+    """Internal graph state used by the wrapper graph."""
 
-    report: str = Field(..., description="Final research report in markdown.")
-    messages: List[BaseMessage] = Field(
-        default_factory=list,
-        description="Full message trace (including intermediate reasoning) for auditing.",
-    )
+    topic: str
+    report: str
+    messages: List[BaseMessage]
 
 
-def _prepare_input(data: DeepResearchInput) -> dict:
-    """Convert topic string into the AgentInputState expected by the main graph."""
-    topic = data.topic.strip()
+class TopicOutput(BaseModel):
+    """Structured response returned to Smithery clients."""
+
+    report: str
+    messages: List[BaseMessage]
+
+
+topic_graph_builder = StateGraph(
+    TopicState,
+    input=TopicInput,
+    output=TopicOutput,
+    config_schema=Configuration,
+)
+
+
+async def run_deep_research(state: TopicState, config: RunnableConfig) -> TopicState:
+    """Invoke the original Deep Research graph using the supplied topic."""
+
+    topic = state["topic"].strip()
     if not topic:
         raise ValueError("The 'topic' argument must be a non-empty string.")
-    return {"messages": [HumanMessage(content=topic)]}
 
-
-def _format_output(result: dict) -> DeepResearchOutput:
-    """Select the relevant fields for MCP consumers."""
-    return DeepResearchOutput(
-        report=result.get("final_report", ""),
-        messages=result.get("messages", []),
+    result = await deep_researcher.ainvoke(
+        AgentInputState(messages=[HumanMessage(content=topic)]),
+        config=config,
     )
+    return {
+        "topic": topic,
+        "report": result.get("final_report", ""),
+        "messages": result.get("messages", []),
+    }
 
 
-deep_research_topic_graph = (
-    RunnableLambda(_prepare_input)
-    | deep_researcher
-    | RunnableLambda(_format_output)
-).with_types(input_type=DeepResearchInput, output_type=DeepResearchOutput)
+topic_graph_builder.add_node("run_research", run_deep_research)
+topic_graph_builder.add_edge(START, "run_research")
+topic_graph_builder.add_edge("run_research", END)
+
+deep_research_topic_graph = topic_graph_builder.compile()
