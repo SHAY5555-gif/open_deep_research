@@ -61,6 +61,44 @@ from open_deep_research.utils import (
     think_tool,
 )
 
+# Context limit for Cerebras GLM-4.6 (131K tokens, ~4 chars per token)
+MAX_CONTEXT_CHARS = 400000  # Safe limit below 131K tokens
+MAX_TOOL_OUTPUT_CHARS = 15000  # Max chars per tool output
+MAX_TOTAL_MESSAGES_CHARS = 300000  # Max total message content
+
+
+def truncate_content(content: str, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Truncate content to stay within character limits."""
+    if len(content) <= max_chars:
+        return content
+    return content[:max_chars] + f"\n\n[TRUNCATED - Content exceeded {max_chars} characters]"
+
+
+def get_messages_total_chars(messages: list) -> int:
+    """Calculate total characters in all messages."""
+    total = 0
+    for msg in messages:
+        if hasattr(msg, 'content'):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            total += len(content)
+    return total
+
+
+def trim_messages_to_limit(messages: list, max_chars: int = MAX_TOTAL_MESSAGES_CHARS) -> list:
+    """Remove oldest messages (except system) to stay within limit."""
+    if get_messages_total_chars(messages) <= max_chars:
+        return messages
+
+    # Keep system message if present
+    system_msgs = [m for m in messages if hasattr(m, 'type') and m.type == 'system']
+    other_msgs = [m for m in messages if not (hasattr(m, 'type') and m.type == 'system')]
+
+    # Remove from the beginning (oldest) until under limit
+    while other_msgs and get_messages_total_chars(system_msgs + other_msgs) > max_chars:
+        other_msgs.pop(0)
+
+    return system_msgs + other_msgs
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,7 +112,7 @@ from langchain_openai import ChatOpenAI
 
 def get_cerebras_model(
     max_tokens: int = None,
-    temperature: float = 0.7,
+    temperature: float = 0.2,
 ):
     """Initialize Cerebras using OpenAI-compatible API for tool calling support.
 
@@ -132,25 +170,154 @@ def get_brightdata_client():
             )
 
         try:
-            from brightdata import bdclient
+            from brightdata import BrightDataClient
         except ImportError:
             raise ValueError(
                 "BrightData SDK not installed. Install with: pip install brightdata-sdk>=1.1.0"
             )
 
         serp_zone = os.getenv("SERP_ZONE", "serp_api1")
-        logger.info(f"Initializing BrightData client with SERP zone: {serp_zone}")
+        web_unlocker_zone = os.getenv("WEB_UNLOCKER_ZONE")
+        logger.info(f"Initializing BrightData client with SERP zone: {serp_zone}, Web Unlocker zone: {web_unlocker_zone}")
 
         try:
-            _brightdata_client = bdclient(
-                api_token=api_token,
-                serp_zone=serp_zone
+            _brightdata_client = BrightDataClient(
+                token=api_token,
+                serp_zone=serp_zone,
+                web_unlocker_zone=web_unlocker_zone
             )
         except Exception as e:
-            logger.warning(f"Failed to init with serp_zone, trying without: {e}")
-            _brightdata_client = bdclient(api_token=api_token)
+            logger.warning(f"Failed to init with zones, trying without: {e}")
+            _brightdata_client = BrightDataClient(token=api_token)
 
     return _brightdata_client
+
+
+async def _search_google_async(client, query: str, num_results: int):
+    """Async helper that properly initializes engine context for search."""
+    async with client.engine:
+        return await client.search.google_async(query=query, num_results=num_results)
+
+
+async def _search_bing_async(client, query: str, num_results: int):
+    """Async helper that properly initializes engine context for search."""
+    async with client.engine:
+        return await client.search.bing_async(query=query, num_results=num_results)
+
+
+# ============================================
+# Thread-based helpers for uvloop compatibility
+# BrightData SDK uses nest_asyncio internally which doesn't work with uvloop.
+# Running SDK calls in separate threads with their own event loops solves this.
+# ============================================
+
+def _run_search_in_thread(search_type: str, query: str, num_results: int):
+    """Run BrightData search in a thread with its own event loop and client.
+
+    This avoids uvloop compatibility issues by creating a fresh event loop
+    in a separate thread where nest_asyncio can work properly.
+    """
+    import concurrent.futures
+
+    def _run():
+        api_token = os.getenv("BRIGHTDATA_API_TOKEN")
+        if not api_token:
+            logger.error("[BRIGHTDATA] No API token found in thread")
+            return None
+        serp_zone = os.getenv("SERP_ZONE", "serp_api1")
+        try:
+            from brightdata import BrightDataClient
+            client = BrightDataClient(token=api_token, serp_zone=serp_zone)
+        except Exception as e:
+            logger.error(f"[BRIGHTDATA] Failed to create client in thread: {e}")
+            return None
+        # Create a new event loop in this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            async def search():
+                async with client.engine:
+                    if search_type == "google":
+                        return await client.search.google_async(query=query, num_results=num_results)
+                    elif search_type == "bing":
+                        return await client.search.bing_async(query=query, num_results=num_results)
+                    else:
+                        raise ValueError(f"Unknown search type: {search_type}")
+            return loop.run_until_complete(search())
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run)
+        return future.result(timeout=120)
+
+
+def _run_scrape_in_thread(url: str, response_format: str = "raw"):
+    """Run BrightData scrape in a thread with its own event loop and client.
+
+    This avoids uvloop compatibility issues by creating a fresh event loop
+    in a separate thread where nest_asyncio can work properly.
+    """
+    import concurrent.futures
+
+    def _run():
+        api_token = os.getenv("BRIGHTDATA_API_TOKEN")
+        if not api_token:
+            logger.error("[BRIGHTDATA] No API token found in thread")
+            return None
+        web_unlocker_zone = os.getenv("WEB_UNLOCKER_ZONE")
+        try:
+            from brightdata import BrightDataClient
+            client = BrightDataClient(token=api_token, web_unlocker_zone=web_unlocker_zone)
+        except Exception as e:
+            logger.error(f"[BRIGHTDATA] Failed to create client in thread: {e}")
+            return None
+        # Create a new event loop in this thread for SDK's internal async calls
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return client.scrape_url(url=url, response_format=response_format)
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run)
+        return future.result(timeout=120)
+
+
+def _run_linkedin_search_in_thread(query: str, search_type: str = "profiles"):
+    """Run BrightData LinkedIn search in a thread with its own event loop.
+
+    This avoids uvloop compatibility issues by creating a fresh event loop
+    in a separate thread where nest_asyncio can work properly.
+    """
+    import concurrent.futures
+
+    def _run():
+        api_token = os.getenv("BRIGHTDATA_API_TOKEN")
+        if not api_token:
+            logger.error("[BRIGHTDATA] No API token found in thread")
+            return None
+        try:
+            from brightdata import BrightDataClient
+            client = BrightDataClient(token=api_token)
+        except Exception as e:
+            logger.error(f"[BRIGHTDATA] Failed to create client in thread: {e}")
+            return None
+        # Create a new event loop in this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            if search_type == "jobs":
+                return client.search.linkedin.jobs(keyword=query)
+            else:  # profiles - SDK expects firstName, not keyword
+                return client.search.linkedin.profiles(firstName=query)
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run)
+        return future.result(timeout=120)
 
 
 @tool
@@ -168,28 +335,29 @@ def brightdata_search_google(
         JSON string with search results including titles, URLs, and snippets
     """
     try:
-        client = get_brightdata_client()
-
         logger.info(f"[BRIGHTDATA] Searching Google for: {query}")
-        results = client.search(
-            query=query,
-            search_engine='google',
-            parse=True  # Get parsed results instead of raw HTML
-        )
+        # Use thread-based helper for uvloop compatibility
+        result = _run_search_in_thread("google", query, num_results)
 
-        # Format results
+        if result is None:
+            return json.dumps({
+                'success': False,
+                'error': 'Failed to execute search - check API token and logs'
+            }, ensure_ascii=False)
+
+        # Format results from SearchResult object
         formatted_results = []
-        if isinstance(results, dict):
-            organic = results.get('organic', results.get('results', []))
-            for i, item in enumerate(organic[:num_results]):
+        if hasattr(result, 'data') and result.data:
+            for i, item in enumerate(result.data[:num_results]):
                 formatted_results.append({
                     'position': i + 1,
                     'title': item.get('title', ''),
                     'url': item.get('link', item.get('url', '')),
                     'snippet': item.get('snippet', item.get('description', '')),
                 })
-        elif isinstance(results, list):
-            for i, item in enumerate(results[:num_results]):
+        elif isinstance(result, dict):
+            organic = result.get('organic', result.get('results', result.get('data', [])))
+            for i, item in enumerate(organic[:num_results]):
                 formatted_results.append({
                     'position': i + 1,
                     'title': item.get('title', ''),
@@ -226,28 +394,29 @@ def brightdata_search_bing(
         JSON string with search results including titles, URLs, and snippets
     """
     try:
-        client = get_brightdata_client()
-
         logger.info(f"[BRIGHTDATA] Searching Bing for: {query}")
-        results = client.search(
-            query=query,
-            search_engine='bing',
-            parse=True
-        )
+        # Use thread-based helper for uvloop compatibility
+        result = _run_search_in_thread("bing", query, num_results)
 
-        # Format results
+        if result is None:
+            return json.dumps({
+                'success': False,
+                'error': 'Failed to execute search - check API token and logs'
+            }, ensure_ascii=False)
+
+        # Format results from SearchResult object
         formatted_results = []
-        if isinstance(results, dict):
-            organic = results.get('organic', results.get('results', []))
-            for i, item in enumerate(organic[:num_results]):
+        if hasattr(result, 'data') and result.data:
+            for i, item in enumerate(result.data[:num_results]):
                 formatted_results.append({
                     'position': i + 1,
                     'title': item.get('title', ''),
                     'url': item.get('link', item.get('url', '')),
                     'snippet': item.get('snippet', item.get('description', '')),
                 })
-        elif isinstance(results, list):
-            for i, item in enumerate(results[:num_results]):
+        elif isinstance(result, dict):
+            organic = result.get('organic', result.get('results', result.get('data', [])))
+            for i, item in enumerate(organic[:num_results]):
                 formatted_results.append({
                     'position': i + 1,
                     'title': item.get('title', ''),
@@ -272,34 +441,64 @@ def brightdata_search_bing(
 @tool
 def brightdata_scrape_url(
     url: str,
-    data_format: str = "markdown"
+    response_format: str = "raw"
 ) -> str:
     """Scrape a webpage and extract its content using BrightData.
 
     Args:
         url: The URL to scrape
-        data_format: Output format - 'markdown', 'html', or 'text' (default: 'markdown')
+        response_format: Output format - 'raw', 'markdown', or 'json' (default: 'raw')
 
     Returns:
         JSON string with scraped content
     """
     try:
-        client = get_brightdata_client()
-
         logger.info(f"[BRIGHTDATA] Scraping URL: {url}")
-        result = client.scrape(
-            url=url,
-            data_format=data_format
-        )
+
+        # Use thread-based helper for uvloop compatibility
+        result = _run_scrape_in_thread(url, response_format)
+
+        if result is None:
+            return json.dumps({
+                'success': False,
+                'url': url,
+                'error': 'Failed to execute scrape - check API token and logs'
+            }, ensure_ascii=False)
+
+        # Check for API errors in the response
+        if hasattr(result, 'success') and result.success is False:
+            error_msg = getattr(result, 'error', 'Unknown error')
+            logger.error(f"[BRIGHTDATA] API error: {error_msg}")
+            return json.dumps({
+                'success': False,
+                'url': url,
+                'error': f'BrightData API error: {error_msg}'
+            }, ensure_ascii=False)
+
+        # Handle ScrapeResult object - extract data/content
+        content = ""
+        if hasattr(result, 'data') and result.data:
+            # data is typically a list of dicts
+            if isinstance(result.data, list) and len(result.data) > 0:
+                content = json.dumps(result.data, ensure_ascii=False, indent=2)
+            else:
+                content = str(result.data)
+        elif hasattr(result, 'content'):
+            content = result.content
+        elif isinstance(result, str):
+            content = result
+        else:
+            content = str(result)
 
         return json.dumps({
             'success': True,
             'url': url,
-            'content': result if isinstance(result, str) else str(result),
-            'format': data_format
+            'content': content,
+            'format': response_format
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        logger.error(f"[BRIGHTDATA] Scrape error: {type(e).__name__}: {str(e)}")
         return json.dumps({
             'success': False,
             'url': url,
@@ -314,30 +513,62 @@ def brightdata_crawl_website(
 ) -> str:
     """Crawl a website and extract content from multiple pages using BrightData.
 
+    Note: In SDK v2.0, crawler is not yet fully implemented. This will scrape the main URL.
+
     Args:
         url: The starting URL to crawl
-        max_pages: Maximum number of pages to crawl (default: 10)
+        max_pages: Maximum number of pages to crawl (default: 10, currently ignored)
 
     Returns:
-        JSON string with crawled content from multiple pages
+        JSON string with crawled content
     """
     try:
-        client = get_brightdata_client()
-
         logger.info(f"[BRIGHTDATA] Crawling website: {url}")
-        result = client.crawl(
-            url=url,
-            max_pages=max_pages
-        )
+
+        # Use thread-based helper for uvloop compatibility
+        result = _run_scrape_in_thread(url)
+
+        if result is None:
+            return json.dumps({
+                'success': False,
+                'url': url,
+                'error': 'Failed to execute crawl - check API token and logs'
+            }, ensure_ascii=False)
+
+        # Check for API errors in the response
+        if hasattr(result, 'success') and result.success is False:
+            error_msg = getattr(result, 'error', 'Unknown error')
+            logger.error(f"[BRIGHTDATA] API error: {error_msg}")
+            return json.dumps({
+                'success': False,
+                'url': url,
+                'error': f'BrightData API error: {error_msg}'
+            }, ensure_ascii=False)
+
+        # Handle ScrapeResult object - extract data/content
+        content = ""
+        if hasattr(result, 'data') and result.data:
+            if isinstance(result.data, list) and len(result.data) > 0:
+                content = json.dumps(result.data, ensure_ascii=False, indent=2)
+            else:
+                content = str(result.data)
+        elif hasattr(result, 'content'):
+            content = result.content
+        elif isinstance(result, str):
+            content = result
+        else:
+            content = str(result)
 
         return json.dumps({
             'success': True,
             'url': url,
-            'pages_crawled': len(result) if isinstance(result, list) else 1,
-            'content': result
+            'pages_crawled': 1,
+            'content': content,
+            'note': 'Crawler limited to single page in SDK v2.0'
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        logger.error(f"[BRIGHTDATA] Crawl error: {type(e).__name__}: {str(e)}")
         return json.dumps({
             'success': False,
             'url': url,
@@ -360,27 +591,54 @@ def brightdata_extract_data(
         JSON string with extracted structured data
     """
     try:
-        client = get_brightdata_client()
-
         logger.info(f"[BRIGHTDATA] Extracting data from: {url}")
 
-        # First scrape the URL
-        content = client.scrape(url=url, data_format='text')
+        # Use thread-based helper for uvloop compatibility
+        result = _run_scrape_in_thread(url)
 
-        # Then use parse_content for structured extraction
-        result = client.parse_content(
-            content=content if isinstance(content, str) else str(content),
-            prompt=extraction_prompt
-        )
+        if result is None:
+            return json.dumps({
+                'success': False,
+                'url': url,
+                'error': 'Failed to execute extraction - check API token and logs'
+            }, ensure_ascii=False)
 
+        # Check for API errors in the response
+        if hasattr(result, 'success') and result.success is False:
+            error_msg = getattr(result, 'error', 'Unknown error')
+            logger.error(f"[BRIGHTDATA] API error: {error_msg}")
+            return json.dumps({
+                'success': False,
+                'url': url,
+                'error': f'BrightData API error: {error_msg}'
+            }, ensure_ascii=False)
+
+        # Extract content from ScrapeResult
+        content = ""
+        if hasattr(result, 'data') and result.data:
+            if isinstance(result.data, list) and len(result.data) > 0:
+                content = json.dumps(result.data, ensure_ascii=False, indent=2)
+            else:
+                content = str(result.data)
+        elif hasattr(result, 'content'):
+            content = result.content
+        elif isinstance(result, str):
+            content = result
+        else:
+            content = str(result)
+
+        # Return scraped content with the extraction prompt for manual processing
+        # Note: parse_content is not available in SDK v2.0
         return json.dumps({
             'success': True,
             'url': url,
             'extraction_prompt': extraction_prompt,
-            'extracted_data': result
+            'raw_content': content[:5000] if len(str(content)) > 5000 else content,
+            'note': 'AI extraction not available in SDK v2.0 - use raw content with your own processing'
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        logger.error(f"[BRIGHTDATA] Extract error: {type(e).__name__}: {str(e)}")
         return json.dumps({
             'success': False,
             'url': url,
@@ -391,31 +649,50 @@ def brightdata_extract_data(
 @tool
 def brightdata_search_linkedin(
     query: str,
-    search_type: str = "people"
+    search_type: str = "profiles"
 ) -> str:
     """Search LinkedIn using BrightData (requires LinkedIn zone).
 
     Args:
         query: Search query (name, company, job title, etc.)
-        search_type: Type of search - 'people' or 'companies' (default: 'people')
+        search_type: Type of search - 'profiles', 'jobs', or 'companies' (default: 'profiles')
 
     Returns:
         JSON string with LinkedIn search results
     """
     try:
-        client = get_brightdata_client()
+        logger.info(f"[BRIGHTDATA] Searching LinkedIn for: {query} (type: {search_type})")
 
-        logger.info(f"[BRIGHTDATA] Searching LinkedIn for: {query}")
-        result = client.search_linkedin(
-            query=query,
-            search_type=search_type
-        )
+        # Handle company search - not directly supported
+        if search_type == "companies":
+            return json.dumps({
+                'success': False,
+                'error': 'Company search not directly supported. Use jobs() with company parameter instead.'
+            }, ensure_ascii=False)
+
+        # Use thread-based helper for uvloop compatibility
+        result = _run_linkedin_search_in_thread(query, search_type)
+
+        if result is None:
+            return json.dumps({
+                'success': False,
+                'error': 'Failed to execute LinkedIn search - check API token and logs'
+            }, ensure_ascii=False)
+
+        # Handle result object
+        results_data = []
+        if hasattr(result, 'data') and result.data:
+            results_data = result.data
+        elif isinstance(result, list):
+            results_data = result
+        elif isinstance(result, dict):
+            results_data = result.get('data', result.get('results', [result]))
 
         return json.dumps({
             'success': True,
             'query': query,
             'search_type': search_type,
-            'results': result
+            'results': results_data
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
@@ -532,6 +809,9 @@ You have access to powerful web research tools via BrightData SDK:
 
 Use these tools strategically to gather comprehensive research data.
 BrightData provides enterprise-grade web data collection with anti-bot bypass.
+
+CRITICAL: All research findings MUST include source citations (URLs).
+DO NOT include any claim or fact without a reliable source reference.
 """
 
     supervisor_system_prompt = lead_researcher_prompt.format(
@@ -703,6 +983,9 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     configurable = Configuration.from_runnable_config(config)
     researcher_messages = state.get("researcher_messages", [])
 
+    # Trim messages to prevent context overflow
+    researcher_messages = trim_messages_to_limit(researcher_messages, MAX_TOTAL_MESSAGES_CHARS // 2)
+
     # Get all available research tools
     tools = get_cerebras_brightdata_tools(config)
 
@@ -728,6 +1011,23 @@ Strategy:
 3. Use extraction for structured data when needed
 4. Cross-reference information from multiple sources
 5. Use LinkedIn for people/company research when relevant
+
+## CRITICAL: Citation Requirements - MANDATORY
+**DO NOT write ANY claim, fact, or statement without citing a reliable source.**
+- Every piece of information MUST be backed by a URL from your research
+- If you cannot find a reliable source for a claim, DO NOT include it
+- Always include the source URL next to each fact: [Source: URL]
+- Prefer authoritative sources: official websites, academic papers, reputable news outlets
+- If sources conflict, note the discrepancy and cite all relevant sources
+- NO speculation, NO assumptions, NO unsourced statements
+
+## FORBIDDEN Actions:
+- DO NOT invent or fabricate any information
+- DO NOT use phrases like "likely", "probably", "it seems", "based on general knowledge"
+- DO NOT extrapolate beyond what the sources explicitly state
+- DO NOT combine information from different sources to create new claims
+- If search returns no results, say "No information found" - DO NOT make up answers
+- If you're unsure, say "Unable to verify" - DO NOT guess
 """
 
     researcher_prompt = research_system_prompt.format(
@@ -788,9 +1088,10 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     ]
     observations = await asyncio.gather(*tool_execution_tasks)
 
+    # Truncate tool outputs to prevent context overflow
     tool_outputs = [
         ToolMessage(
-            content=observation,
+            content=truncate_content(str(observation), MAX_TOOL_OUTPUT_CHARS),
             name=tool_call["name"],
             tool_call_id=tool_call["id"]
         )
@@ -827,13 +1128,19 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     researcher_messages = state.get("researcher_messages", [])
     researcher_messages.append(HumanMessage(content=compress_research_simple_human_message))
 
+    # Trim messages to prevent context overflow
+    researcher_messages = trim_messages_to_limit(researcher_messages, MAX_TOTAL_MESSAGES_CHARS // 2)
+
     synthesis_attempts = 0
-    max_attempts = 3
+    max_attempts = 5  # Increased retries with more aggressive trimming
 
     while synthesis_attempts < max_attempts:
         try:
             compression_prompt = compress_research_system_prompt.format(date=get_today_str())
             messages = [SystemMessage(content=compression_prompt)] + researcher_messages
+
+            # Final trim before invoke
+            messages = trim_messages_to_limit(messages, MAX_TOTAL_MESSAGES_CHARS // 2)
 
             response = await synthesizer_model.ainvoke(messages)
 
@@ -849,11 +1156,17 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
 
         except Exception as e:
             synthesis_attempts += 1
+            logger.warning(f"[COMPRESS] Attempt {synthesis_attempts} failed: {e}")
 
-            if is_token_limit_exceeded(e, configurable.research_model):
-                researcher_messages = remove_up_to_last_ai_message(researcher_messages)
+            if is_token_limit_exceeded(e, configurable.research_model) or "context_length" in str(e).lower():
+                # Aggressive trimming - remove half the messages on each retry
+                current_len = len(researcher_messages)
+                researcher_messages = researcher_messages[current_len // 2:]
+                logger.info(f"[COMPRESS] Trimmed messages from {current_len} to {len(researcher_messages)}")
                 continue
 
+            # Also trim on other errors as a precaution
+            researcher_messages = remove_up_to_last_ai_message(researcher_messages)
             continue
 
     raw_notes_content = "\n".join([
@@ -881,6 +1194,65 @@ researcher_builder.add_edge("compress_research", END)
 researcher_subgraph = researcher_builder.compile()
 
 
+async def verify_findings(state: AgentState, config: RunnableConfig):
+    """Verify research findings - remove unsourced claims and validate citations."""
+
+    configurable = Configuration.from_runnable_config(config)
+    notes = state.get("notes", [])
+    raw_notes = state.get("raw_notes", [])
+
+    if not notes:
+        return {"notes": {"type": "override", "value": []}}
+
+    findings = "\n".join(notes)
+
+    # Use the model to filter and verify findings
+    verifier_model = get_cerebras_model(
+        max_tokens=configurable.research_model_max_tokens,
+    )
+
+    verification_prompt = f"""You are a strict fact-checker and editor. Your job is to review research findings and REMOVE any information that lacks proper source citations.
+
+## Research Findings to Verify:
+{findings}
+
+## Your Task:
+1. Go through EACH claim/fact in the findings
+2. CHECK if it has a URL source citation
+3. REMOVE completely any claim that:
+   - Has NO source URL
+   - Has a vague source like "according to sources" without URL
+   - Appears to be speculation or assumption
+   - Uses phrases like "likely", "probably", "it seems" without evidence
+
+4. KEEP only claims that have:
+   - A specific URL citation
+   - Clear factual information from that source
+
+## Output Format:
+Return ONLY the verified findings with proper citations.
+If a section has no verified claims, write: "[No verified information available for this topic]"
+
+DO NOT add any new information. DO NOT speculate. ONLY keep what has sources.
+
+## Verified Findings:"""
+
+    try:
+        response = await verifier_model.ainvoke([HumanMessage(content=verification_prompt)])
+        verified_findings = response.content
+
+        logger.info(f"[VERIFICATION] Original findings length: {len(findings)}, Verified length: {len(verified_findings)}")
+
+        return {
+            "notes": {"type": "override", "value": [verified_findings]},
+            "raw_notes": raw_notes  # Keep raw notes for reference
+        }
+    except Exception as e:
+        logger.error(f"[VERIFICATION] Error during verification: {e}")
+        # On error, pass through original notes
+        return {"notes": notes}
+
+
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """Generate the final comprehensive research report."""
 
@@ -899,12 +1271,21 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
 
     while current_retry <= max_retries:
         try:
+            citation_requirement = """
+
+CRITICAL REQUIREMENT: Every fact and claim in this report MUST include a source citation.
+- Include [Source: URL] after each factual statement
+- If a finding lacks a source, DO NOT include it in the report
+- Prefer authoritative sources (official sites, academic papers, reputable news)
+- NO unsourced claims, NO speculation, NO assumptions
+- If you don't have verified information on a topic, write "No verified information available" instead of making things up
+"""
             final_report_prompt = final_report_generation_prompt.format(
                 research_brief=state.get("research_brief", ""),
                 messages=get_buffer_string(state.get("messages", [])),
                 findings=findings,
                 date=get_today_str()
-            )
+            ) + citation_requirement
 
             final_report = await writer_model.ainvoke([
                 HumanMessage(content=final_report_prompt)
@@ -962,11 +1343,13 @@ cerebras_brightdata_researcher_builder = StateGraph(
 cerebras_brightdata_researcher_builder.add_node("clarify_with_user", clarify_with_user)
 cerebras_brightdata_researcher_builder.add_node("write_research_brief", write_research_brief)
 cerebras_brightdata_researcher_builder.add_node("research_supervisor", supervisor_subgraph)
+cerebras_brightdata_researcher_builder.add_node("verify_findings", verify_findings)
 cerebras_brightdata_researcher_builder.add_node("final_report_generation", final_report_generation)
 
 # Add edges
 cerebras_brightdata_researcher_builder.add_edge(START, "clarify_with_user")
-cerebras_brightdata_researcher_builder.add_edge("research_supervisor", "final_report_generation")
+cerebras_brightdata_researcher_builder.add_edge("research_supervisor", "verify_findings")
+cerebras_brightdata_researcher_builder.add_edge("verify_findings", "final_report_generation")
 cerebras_brightdata_researcher_builder.add_edge("final_report_generation", END)
 
 # Compile the main graph
