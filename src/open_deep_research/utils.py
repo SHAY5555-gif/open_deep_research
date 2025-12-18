@@ -31,8 +31,8 @@ from mcp import McpError
 from tavily import AsyncTavilyClient
 from firecrawl import AsyncFirecrawl
 
-# Note: brightdata.bdclient is imported lazily in brightdata_search_async() to avoid
-# import errors when the package version doesn't have the bdclient export
+# Note: brightdata.BrightDataClient is imported lazily in brightdata_search_async() to avoid
+# import errors when the package is not installed
 
 from open_deep_research.configuration import Configuration, FilesystemConfig, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
@@ -150,7 +150,7 @@ async def brightdata_search_async(
 
     # Lazy import of BrightData client
     try:
-        from brightdata import bdclient
+        from brightdata import BrightDataClient
     except ImportError:
         raise ToolException(
             "BrightData SDK not properly installed. Please install with: pip install brightdata-sdk>=1.1.0"
@@ -158,29 +158,25 @@ async def brightdata_search_async(
 
     # Initialize the BrightData client with API token and SERP zone
     serp_zone = os.getenv("SERP_ZONE", "serp_api1")
-    print(f"[BRIGHTDATA] Initializing bdclient with SERP zone: {serp_zone}")
+    print(f"[BRIGHTDATA] Initializing BrightDataClient with SERP zone: {serp_zone}")
 
     try:
-        client = bdclient(
-            api_token=api_token,
+        client = BrightDataClient(
+            token=api_token,
             serp_zone=serp_zone
         )
     except Exception as e:
         # Fallback: try with just API token
         print(f"[BRIGHTDATA] Failed to init with serp_zone, trying without: {e}")
-        client = bdclient(api_token=api_token)
+        client = BrightDataClient(token=api_token)
 
     # Execute searches for each query
     search_results = []
     for query in search_queries:
         try:
-            # Use BrightData SDK Google search with parse=True for structured results
+            # Use BrightData SDK v2.0 hierarchical API for Google search
             print(f"[BRIGHTDATA] Searching Google for: {query}")
-            results = client.search(
-                query=query,
-                search_engine='google',
-                parse=True  # Get parsed results instead of raw HTML
-            )
+            result = client.search.google(query=query, num_results=max_results)
 
             # Format to match expected structure
             formatted_result = {
@@ -188,9 +184,19 @@ async def brightdata_search_async(
                 'results': []
             }
 
-            # Handle the results - when parse=True, results is a dict with 'organic' key
-            if isinstance(results, dict):
-                organic_results = results.get('organic', results.get('results', []))
+            # Handle SearchResult object - data attribute contains the results
+            if hasattr(result, 'data') and result.data:
+                print(f"[BRIGHTDATA] Successfully received {len(result.data)} results for query: {query}")
+                for i, item in enumerate(result.data[:max_results]):
+                    formatted_result['results'].append({
+                        'url': item.get('link', item.get('url', '')),
+                        'title': item.get('title', ''),
+                        'content': item.get('snippet', item.get('description', '')),
+                        'score': 1.0 - (i * 0.1)  # Simple scoring based on position
+                    })
+            elif isinstance(result, dict):
+                # Fallback for dict response
+                organic_results = result.get('organic', result.get('results', result.get('data', [])))
                 if organic_results:
                     print(f"[BRIGHTDATA] Successfully received {len(organic_results)} results for query: {query}")
                     for i, item in enumerate(organic_results[:max_results]):
@@ -198,22 +204,10 @@ async def brightdata_search_async(
                             'url': item.get('link', item.get('url', '')),
                             'title': item.get('title', ''),
                             'content': item.get('snippet', item.get('description', '')),
-                            'score': 1.0 - (i * 0.1)  # Simple scoring based on position
+                            'score': 1.0 - (i * 0.1)
                         })
-                else:
-                    print(f"[BRIGHTDATA] No organic results for query '{query}'. Keys: {results.keys()}")
-            elif isinstance(results, list):
-                # Handle list response format
-                print(f"[BRIGHTDATA] Successfully received {len(results)} results for query: {query}")
-                for i, item in enumerate(results[:max_results]):
-                    formatted_result['results'].append({
-                        'url': item.get('link', item.get('url', '')),
-                        'title': item.get('title', ''),
-                        'content': item.get('snippet', item.get('description', '')),
-                        'score': 1.0 - (i * 0.1)
-                    })
             else:
-                print(f"[BRIGHTDATA] Unexpected results type for query '{query}': {type(results)}")
+                print(f"[BRIGHTDATA] Unexpected results type for query '{query}': {type(result)}")
 
             search_results.append(formatted_result)
         except Exception as e:
